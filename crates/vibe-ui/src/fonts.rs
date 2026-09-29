@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Prefer system Adwaita Sans 12. Register bundled Inter as a fallback.
 //! GTK4 CSS does not support `@font-face`.
 

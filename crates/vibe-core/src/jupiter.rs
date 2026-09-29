@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Jupiter Swap V2 meta-aggregator: `/swap/v2/order` + `/swap/v2/execute`.
 //!
 //! Base URL is `https://api.jup.ag`. An API key (`x-api-key`) is recommended
@@ -26,6 +24,9 @@ pub const REFERRAL_FEE_BPS: u16 = 50;
 #[derive(Clone, Debug, Default)]
 pub struct Client {
     pub api_key: Option<String>,
+    /// 1.9: priority fee picked in the Confirm window, sent as `priorityFeeLamports`
+    /// with `broadcastFeeType=maxCap`. None = Jupiter auto.
+    pub priority_fee_lamports: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +84,7 @@ impl Client {
         let api_key = api_key
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        Self { api_key }
+        Self { api_key, priority_fee_lamports: None }
     }
 
     pub fn from_env_or(settings_key: &str) -> Self {
@@ -163,6 +164,9 @@ impl Client {
         if let Some(bps) = slippage_bps.filter(|b| *b > 0) {
             url.push_str("&slippageBps=");
             url.push_str(&bps.to_string());
+        }
+        if let Some(fee) = self.priority_fee_lamports {
+            url.push_str(&priority_query(fee));
         }
         if with_referral {
             url.push_str("&referralAccount=");
@@ -321,6 +325,12 @@ pub fn jito_send_tx(signed_b64: &str) -> Result<String> {
         .to_string())
 }
 
+/// Query suffix for a picked priority fee (clamped to the vault cap).
+pub fn priority_query(lamports: u64) -> String {
+    let fee = lamports.min(crate::fees::MAX_PRIORITY_FEE_LAMPORTS);
+    format!("&priorityFeeLamports={fee}&broadcastFeeType=maxCap")
+}
+
 fn jup_mint(mint: &str) -> String {
     let t = mint.trim();
     if t.is_empty() || t.eq_ignore_ascii_case("native") || t.eq_ignore_ascii_case("sol") {
@@ -425,6 +435,13 @@ fn parse_order(v: Value) -> Result<Order> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priority_query_is_capped() {
+        assert_eq!(priority_query(5_000), "&priorityFeeLamports=5000&broadcastFeeType=maxCap");
+        assert!(priority_query(u64::MAX).contains(&crate::fees::MAX_PRIORITY_FEE_LAMPORTS.to_string()));
+        assert_eq!(Client::new(None).priority_fee_lamports, None);
+    }
 
     #[test]
     fn native_sol_becomes_wsol() {

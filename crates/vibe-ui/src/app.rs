@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use adw::prelude::*;
 use gio::prelude::*;
 use vibe_core::{APP_ID, APP_NAME, APP_VERSION, DEVELOPER, HOMEPAGE};

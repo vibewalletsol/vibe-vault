@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Wallet kind tags for mnemonic, private-key, hardware, and watch accounts.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

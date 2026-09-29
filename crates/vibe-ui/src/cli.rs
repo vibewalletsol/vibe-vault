@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Headless create/import. GTK never starts. JSON on stdin/stdout.
 
 use std::io::{Read, Write};

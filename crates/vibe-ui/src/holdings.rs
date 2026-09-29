@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use adw::prelude::*;
 use vibe_core::coingecko::Holding;
 use vibe_core::format::{format_ui_amount, format_usd};

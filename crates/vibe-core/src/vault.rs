@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Argon2id + XSalsa20-Poly1305 vault blobs.
 //! INTERACTIVE ops=2, mem=64 MiB, parallel=1, 16-byte salt, 24-byte nonce.
 

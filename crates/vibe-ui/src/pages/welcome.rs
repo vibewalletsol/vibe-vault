@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use adw::prelude::*;
 
 use crate::ctx::Ctx;
@@ -26,9 +24,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     sub.set_wrap(true);
     sub.add_css_class("og-muted");
 
-    let create = gtk::Button::with_label("Create wallet");
+    let create = gtk::Button::with_label(tr("Create wallet"));
     create.add_css_class("og-primary");
-    let import = gtk::Button::with_label("Import seed or secret key");
+    let import = gtk::Button::with_label(tr("Import seed or secret key"));
     import.add_css_class("og-ghost");
 
     let ctx_c = ctx.clone();

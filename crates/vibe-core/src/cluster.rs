@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! RPC cluster selection with a multi-endpoint pool.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +24,16 @@ impl Cluster {
             Cluster::Devnet => "https://api.devnet.solana.com",
             Cluster::Testnet => "https://api.testnet.solana.com",
             Cluster::Custom(url) => url.as_str(),
+        }
+    }
+
+    /// Genesis hash of a public cluster (None for Custom: learned from the primary RPC).
+    pub fn genesis_hash(&self) -> Option<&'static str> {
+        match self {
+            Cluster::Mainnet => Some(crate::rpc::GENESIS_MAINNET),
+            Cluster::Devnet => Some(crate::rpc::GENESIS_DEVNET),
+            Cluster::Testnet => Some(crate::rpc::GENESIS_TESTNET),
+            Cluster::Custom(_) => None,
         }
     }
 

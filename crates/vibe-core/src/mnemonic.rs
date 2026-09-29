@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use bip39::{Language, Mnemonic};
 use rand::RngCore;
 use zeroize::Zeroize;

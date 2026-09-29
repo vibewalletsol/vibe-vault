@@ -14,6 +14,12 @@ ship in VIBE Wallet packages:
 | `vibe-keys`  | `crates/vibe-core/src/bin/vibe-keys.rs` | headless key export (JSON over stdin/stdout)  |
 | `vibe-mcp`   | `crates/vibe-core/src/bin/vibe-mcp.rs`  | stdio MCP server; write tools open the vault Confirm screen |
 
+Also included: the vault translations (`po/vault`; installed builds load compiled catalogs
+from the system locale dirs, a source checkout reads `po/vault` with
+`VIBE_DEV=1`) and
+the Anchor IDL files the vault uses to label program instructions
+(`crates/vibe-core/idl`, compiled in).
+
 The VIBE Wallet desk (the Python app, browser extension and GNOME extension) is
 not part of this repository and is distributed separately under its own terms.
 
@@ -49,8 +55,11 @@ the default Adwaita look.
 ## Verifying a release binary
 
 Each VIBE Wallet release names the tag of this repository it was built from
-(for 1.8.1: `v1.8.1`). Once the Old Growth Crypto release key is published,
-release checksums (`SHA256SUMS`) are signed with it; verify with
+(for 1.9.0: `v1.9.0`). Release checksums (`SHA256SUMS`) are signed with the
+Old Growth Crypto release signing key, fingerprint
+`58B0 78BE 5C1D B227 8043  67A7 28EB 45CC 198C 2D3D`, which is attached to each
+[VIBE Wallet release](https://github.com/vibewalletsol/VibeWallet/releases) as
+`vibewallet-release-signing-key.asc`. Verify with
 `gpg --verify SHA256SUMS.asc SHA256SUMS` and then `sha256sum -c SHA256SUMS`.
 
 ## License
@@ -69,5 +78,6 @@ Licenses of the Rust crates compiled into the binaries are in
 
 ## Security
 
-Please report vulnerabilities privately to vibewalletsol@gmail.com.
+Please report vulnerabilities privately to vibewalletsol@gmail.com (see
+[SECURITY.md](SECURITY.md)).
 Never send seed phrases or private keys to anyone, including us.

@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use adw::prelude::*;
 use vibe_core::store::{self, Contact};
 use vibe_core::{format, parse_sol, tx};
@@ -23,10 +21,10 @@ pub fn address_book(ctx: &Ctx) -> gtk::Widget {
     title.add_css_class("og-page-title");
     title.set_xalign(0.0);
     let name = gtk::Entry::new();
-    name.set_placeholder_text(Some("Name"));
+    name.set_placeholder_text(Some(tr("Name")));
     let addr = gtk::Entry::new();
-    addr.set_placeholder_text(Some("Solana address"));
-    let add = gtk::Button::with_label("Add contact");
+    addr.set_placeholder_text(Some(tr("Solana address")));
+    let add = gtk::Button::with_label(tr("Add contact"));
     add.add_css_class("og-primary");
     let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     redraw_contacts(ctx, &list);
@@ -115,8 +113,8 @@ pub fn explorer(ctx: &Ctx) -> gtk::Widget {
     title.add_css_class("og-page-title");
     title.set_xalign(0.0);
     let entry = gtk::Entry::new();
-    entry.set_placeholder_text(Some("Transaction signature"));
-    let go = gtk::Button::with_label("Lookup");
+    entry.set_placeholder_text(Some(tr("Transaction signature")));
+    let go = gtk::Button::with_label(tr("Lookup"));
     go.add_css_class("og-primary");
     let out = gtk::TextView::new();
     out.set_editable(false);
@@ -272,7 +270,7 @@ pub fn desk(_ctx: &Ctx) -> gtk::Widget {
     ));
     body.set_wrap(true);
     body.set_xalign(0.0);
-    let open = gtk::Button::with_label("Open net worth desk");
+    let open = gtk::Button::with_label(tr("Open net worth desk"));
     open.add_css_class("og-primary");
     open.connect_clicked(|_| {
         let _ = std::process::Command::new("vibe-wallet").spawn();

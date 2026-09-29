@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use adw::prelude::*;
 
 use crate::ctx::Ctx;
@@ -35,9 +33,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     let pass = gtk::PasswordEntry::new();
     pass.set_show_peek_icon(true);
     pass.set_hexpand(true);
-    pass.set_placeholder_text(Some("Password"));
+    pass.set_placeholder_text(Some(tr("Password")));
 
-    let go = gtk::Button::with_label("Unlock");
+    let go = gtk::Button::with_label(tr("Unlock"));
     go.add_css_class("og-primary");
     let forgot = gtk::Label::new(Some(
         "Forgot the password? The seed phrase is the only recovery.",

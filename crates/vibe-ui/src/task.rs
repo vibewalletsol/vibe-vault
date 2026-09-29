@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 /// Run `work` on a background thread, then `complete` on the GTK main loop.
 pub fn spawn<T, F, C>(work: F, complete: C)
 where

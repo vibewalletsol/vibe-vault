@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -79,9 +77,9 @@ fn send_form(ctx: &Ctx) -> gtk::Widget {
     bal.add_css_class("og-muted");
     bal.set_xalign(0.0);
     let dest = gtk::Entry::new();
-    dest.set_placeholder_text(Some("Destination address"));
+    dest.set_placeholder_text(Some(tr("Destination address")));
     let amount = gtk::Entry::new();
-    amount.set_placeholder_text(Some("Amount"));
+    amount.set_placeholder_text(Some(tr("Amount")));
     let pref_dest = env_trim("VIBE_SEND_DEST");
     if !pref_dest.is_empty() {
         dest.set_text(&pref_dest);
@@ -95,7 +93,7 @@ fn send_form(ctx: &Ctx) -> gtk::Widget {
     status.add_css_class("og-muted");
     status.set_wrap(true);
     status.set_xalign(0.0);
-    let go = gtk::Button::with_label("Review send");
+    let go = gtk::Button::with_label(tr("Review send"));
     go.add_css_class("og-primary");
 
     let ctx_map = ctx.clone();
@@ -313,7 +311,7 @@ fn sync_asset_labels(
     let list = assets.borrow();
     let Some(asset) = list.get(drop.selected() as usize) else {
         bal.set_text("");
-        amount.set_placeholder_text(Some("Amount"));
+        amount.set_placeholder_text(Some(tr("Amount")));
         return;
     };
     if asset.ui_amount.is_empty() {
@@ -377,7 +375,7 @@ fn receive_form(ctx: &Ctx, shell: &ShellWidgets) -> gtk::Widget {
     shell.receive_addr.set_wrap(true);
     shell.receive_addr.set_xalign(0.0);
 
-    let copy = gtk::Button::with_label("Copy address");
+    let copy = gtk::Button::with_label(tr("Copy address"));
     copy.add_css_class("og-primary");
     let ctx_c = ctx.clone();
     copy.connect_clicked(move |_| {

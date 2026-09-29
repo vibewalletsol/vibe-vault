@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -62,7 +60,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     let bal_lbl = gtk::Label::new(Some("Balance: —"));
     bal_lbl.add_css_class("og-muted");
     bal_lbl.set_xalign(0.0);
-    let max = gtk::Button::with_label("Max");
+    let max = gtk::Button::with_label(tr("Max"));
     max.add_css_class("og-ghost");
 
     let out_lbl = gtk::Label::new(Some("You receive —"));
@@ -86,12 +84,12 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     to_drop.set_hexpand(true);
     recv_row.append(&to_drop);
 
-    let flip = gtk::Button::with_label("↕ Flip");
+    let flip = gtk::Button::with_label(tr("↕ Flip"));
     flip.add_css_class("og-ghost");
 
-    let qbtn = gtk::Button::with_label("Get quote");
+    let qbtn = gtk::Button::with_label(tr("Get quote"));
     qbtn.add_css_class("og-ghost");
-    let sbtn = gtk::Button::with_label("Review swap");
+    let sbtn = gtk::Button::with_label(tr("Review swap"));
     sbtn.add_css_class("og-primary");
     sbtn.set_sensitive(false);
 
@@ -179,7 +177,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         update_balance_label(&bal_c, &from_a.borrow(), from_d.selected());
     };
 
-    let fill_btn = gtk::Button::with_label("Refresh tokens");
+    let fill_btn = gtk::Button::with_label(tr("Refresh tokens"));
     fill_btn.add_css_class("og-ghost");
     let fill_c = fill.clone();
     fill_btn.connect_clicked(move |_| fill_c());

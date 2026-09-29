@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! CoinGecko client — same endpoints the Portfolio app uses
 //! (`/coins/markets`, `/coins/solana/contract/{mint}`, icon download).
 

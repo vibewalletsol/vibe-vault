@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use crate::error::{Error, Result};
 use crate::LAMPORTS_PER_SOL;
 

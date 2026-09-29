@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-// Portions derived from Cinder (https://github.com/gregnb/cinder),
-// Copyright (c) 2026 Gregory Nowakowski, MIT License (see LICENSES/MIT-Cinder.txt).
 //! Human-readable Solana instruction decode for explorer, MCP, and review UI.
 
 use serde_json::{json, Value};
@@ -228,6 +224,7 @@ fn decode_system(data: &[u8], accounts: &[tx::AccountMeta]) -> (String, String) 
     };
     match ix {
         0 => ("Create account".into(), short(&first_account(accounts, 1))),
+        3 => ("Create account (seed)".into(), short(&first_account(accounts, 1))),
         2 => {
             let lamports = if data.len() >= 12 {
                 u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]))
@@ -303,14 +300,55 @@ fn decode_stake(data: &[u8], accounts: &[tx::AccountMeta]) -> (String, String) {
     } else {
         255
     };
+    // 1.9 F7: every Stake program instruction gets a name (display only).
     let title = match ix {
         0 => "Initialize stake",
+        1 => "Authorize stake",
         2 => "Delegate stake",
+        3 => "Split stake",
         4 => "Withdraw stake",
         5 => "Deactivate stake",
+        6 => "Set stake lockup",
+        7 => "Merge stake",
+        8 => "Authorize stake (seed)",
+        9 => "Initialize stake (checked)",
+        10 => "Authorize stake (checked)",
+        11 => "Authorize stake (checked, seed)",
+        12 => "Set stake lockup (checked)",
+        13 => "Get minimum delegation",
+        14 => "Deactivate delinquent stake",
+        15 => "Redelegate stake",
+        16 => "Move stake",
+        17 => "Move lamports",
         _ => "Stake",
     };
-    (title.into(), short(&first_account(accounts, 0)))
+    let detail = match ix {
+        2 => format!(
+            "{} → validator {}",
+            short(&first_account(accounts, 0)),
+            short(&first_account(accounts, 1))
+        ),
+        4 => {
+            let lamports = if data.len() >= 12 {
+                u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]))
+            } else {
+                0
+            };
+            format!(
+                "{} → {}  ({} lamports)",
+                short(&first_account(accounts, 0)),
+                short(&first_account(accounts, 1)),
+                lamports
+            )
+        }
+        3 | 7 | 16 | 17 => format!(
+            "{} → {}",
+            short(&first_account(accounts, 0)),
+            short(&first_account(accounts, 1))
+        ),
+        _ => short(&first_account(accounts, 0)),
+    };
+    (title.into(), detail)
 }
 
 fn first_account(accounts: &[tx::AccountMeta], idx: usize) -> String {

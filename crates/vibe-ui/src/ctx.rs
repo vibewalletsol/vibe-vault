@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -12,6 +9,21 @@ use vibe_core::store::{
 use vibe_core::{Cluster, Keypair};
 
 use crate::task;
+
+static RPC_CACHE: std::sync::Mutex<Option<(String, Rpc)>> = std::sync::Mutex::new(None);
+
+fn shared_rpc(primary: &str, fallbacks: &[String], genesis: Option<&str>) -> Rpc {
+    let key = format!("{primary}|{}|{}", fallbacks.join(","), genesis.unwrap_or(""));
+    let mut g = RPC_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, r)) = g.as_ref() {
+        if *k == key {
+            return r.clone();
+        }
+    }
+    let r = Rpc::with_endpoints(primary, fallbacks, genesis);
+    *g = Some((key, r.clone()));
+    r
+}
 
 #[derive(Clone)]
 pub struct Unlocked {
@@ -167,14 +179,24 @@ impl Ctx {
         task::toast(&self.toasts, msg);
     }
 
+    /// Vault RPC with ordered failover (1.9). Primary = `VIBE_RPC_URL` from the desk or the
+    /// vault setting; fallbacks = `VIBE_RPC_FALLBACKS` from the desk or the vault setting.
+    /// One shared instance per (primary, fallbacks) so the active endpoint sticks.
     pub fn rpc(&self) -> Rpc {
-        if let Ok(url) = std::env::var("VIBE_RPC_URL") {
-            let url = url.trim().to_string();
-            if !url.is_empty() {
-                return Rpc::new(url);
-            }
-        }
-        Rpc::new(self.state.borrow().settings.rpc_url())
+        let st = self.state.borrow();
+        let primary = std::env::var("VIBE_RPC_URL")
+            .ok()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| st.settings.rpc_url());
+        let fallbacks = match std::env::var("VIBE_RPC_FALLBACKS") {
+            Ok(raw) if !raw.trim().is_empty() => vibe_core::rpc::parse_endpoint_list(&raw),
+            _ => st.settings.rpc_fallbacks.clone(),
+        };
+        // window.rs already folds the desk's VIBE_CLUSTER into settings.cluster.
+        let genesis = st.settings.cluster().genesis_hash();
+        drop(st);
+        shared_rpc(&primary, &fallbacks, genesis)
     }
 
     pub fn cluster(&self) -> Cluster {

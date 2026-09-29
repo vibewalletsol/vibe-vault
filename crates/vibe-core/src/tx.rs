@@ -1,8 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-// Portions derived from Cinder (https://github.com/gregnb/cinder),
-// Copyright (c) 2026 Gregory Nowakowski, MIT License (see LICENSES/MIT-Cinder.txt).
-
 use crate::error::{Error, Result};
 use crate::keypair::Keypair;
 use crate::programs::ProgramIds;
@@ -1152,6 +1147,8 @@ where
     F: FnMut(usize, &[u8]) -> Result<[u8; 64]>,
 {
     let message = compile_legacy_message(fee_payer, recent_blockhash, ixs)?;
+    // 1.9 R14b: the vault never signs a message whose priority fee is over the cap.
+    crate::fees::check_message(&message).map_err(Error::msg)?;
     let n_signers = message[0] as usize;
     if signer_pubs.len() != n_signers {
         return Err(Error::msg(format!(
@@ -1224,6 +1221,8 @@ where
         return Err(Error::msg("transaction truncated"));
     }
     let message = tx[msg_start..].to_vec();
+    // 1.9 R14b: fee cap on the exact bytes (Jupiter / dApp / WalletConnect transactions).
+    crate::fees::check_message(&message).map_err(Error::msg)?;
     let keys = message_signer_keys(&message, n_sigs)?;
     let slot = keys
         .iter()
@@ -1304,6 +1303,24 @@ pub fn sign_message_bytes(bytes: &[u8], keypair: &Keypair) -> String {
 mod tests {
     use super::*;
     use crate::keypair::Keypair;
+
+    #[test]
+    fn signing_refuses_fee_over_vault_cap() {
+        let kp = Keypair::generate();
+        let from = kp.address();
+        let to = Keypair::generate().address();
+        let hash = Keypair::generate().address();
+        let ok = [set_compute_unit_limit(80_000), set_compute_unit_price(25_000), system_transfer(&from, &to, 1)];
+        assert!(build_signed_legacy(&from, &hash, &ok, &[&kp]).is_ok());
+        let bad = [set_compute_unit_limit(1_400_000), set_compute_unit_price(40_000_000), system_transfer(&from, &to, 1)];
+        let e = build_signed_legacy(&from, &hash, &bad, &[&kp]).unwrap_err().to_string();
+        assert!(e.contains("R14b"), "{e}");
+        // Same gate on the wire-signing path (Jupiter / dApp transactions).
+        let mut wire = unsigned_legacy(&from, &hash, &bad).unwrap();
+        assert!(sign_wire_transaction(&mut wire, &kp).unwrap_err().to_string().contains("R14b"));
+        let mut wire = unsigned_legacy(&from, &hash, &ok).unwrap();
+        assert!(sign_wire_transaction(&mut wire, &kp).is_ok());
+    }
 
     #[test]
     fn sign_message_bytes_is_64() {

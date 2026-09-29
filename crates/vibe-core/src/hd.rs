@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! SLIP-0010 Ed25519 derivation.
 //! Default path `m/44'/501'/0'/0'` is Phantom / Ledger compatible.
 

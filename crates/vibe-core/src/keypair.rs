@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use zeroize::{Zeroize, ZeroizeOnDrop};

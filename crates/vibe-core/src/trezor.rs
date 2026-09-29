@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-// Portions derived from Cinder (https://github.com/gregnb/cinder),
-// Copyright (c) 2026 Gregory Nowakowski, MIT License (see LICENSES/MIT-Cinder.txt).
 //! Trezor Solana over Linux hidraw (One) and WebUSB (T / Safe 3 / Safe 5).
 //! Protocol v1 protobuf. Codec is tested without a device. USB I/O is best-effort.
 

@@ -1,12 +1,10 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use vibe_core::rpc::Snapshot;
 use vibe_core::store::{self, WalletStore};
+use vibe_core::i18n::{n_, tr};
 use vibe_core::{Cluster, APP_NAME};
 
 use crate::ctx::{AppState, Ctx};
@@ -25,80 +23,80 @@ struct NavGroup {
 
 const NAV: &[NavGroup] = &[
     NavGroup {
-        kicker: "Wallet",
+        kicker: n_("Wallet"),
         items: &[
             NavItem {
                 id: "dashboard",
-                label: "Dashboard",
+                label: n_("Dashboard"),
                 icon: "view-grid-symbolic",
             },
             NavItem {
                 id: "wallets",
-                label: "Wallets",
+                label: n_("Wallets"),
                 icon: "network-workgroup-symbolic",
             },
             NavItem {
                 id: "activity",
-                label: "Activity",
+                label: n_("Activity"),
                 icon: "view-list-symbolic",
             },
             NavItem {
                 id: "assets",
-                label: "Assets",
+                label: n_("Assets"),
                 icon: "package-x-generic-symbolic",
             },
         ],
     },
     NavGroup {
-        kicker: "Move",
+        kicker: n_("Move"),
         items: &[
             NavItem {
                 id: "send",
-                label: "Send / Receive",
+                label: n_("Send / Receive"),
                 icon: "mail-send-symbolic",
             },
             NavItem {
                 id: "swap",
-                label: "Swap",
+                label: n_("Swap"),
                 icon: "emblem-synchronizing-symbolic",
             },
             NavItem {
                 id: "staking",
-                label: "Staking",
+                label: n_("Staking"),
                 icon: "network-server-symbolic",
             },
         ],
     },
     NavGroup {
-        kicker: "Tools",
+        kicker: n_("Tools"),
         items: &[
             NavItem {
                 id: "addressbook",
-                label: "Address Book",
+                label: n_("Address Book"),
                 icon: "x-office-address-book-symbolic",
             },
             NavItem {
                 id: "explorer",
-                label: "Explorer",
+                label: n_("Explorer"),
                 icon: "edit-find-symbolic",
             },
             NavItem {
                 id: "terminal",
-                label: "Terminal",
+                label: n_("Terminal"),
                 icon: "utilities-terminal-symbolic",
             },
             NavItem {
                 id: "desk",
-                label: "Net worth desk",
+                label: n_("Net worth desk"),
                 icon: "view-paged-symbolic",
             },
         ],
     },
     NavGroup {
-        kicker: "System",
+        kicker: n_("System"),
         items: &[NavItem {
             id: "settings",
-            label: "Settings",
+            label: n_("Settings"),
             icon: "preferences-system-symbolic",
         }],
     },
@@ -248,7 +246,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
 
     *ctx.shell.borrow_mut() = Some(handles);
 
-    let title_text = "Dashboard";
+    let title_text = tr("Dashboard");
     let title = gtk::Label::new(Some(title_text));
     title.add_css_class("og-heading");
 
@@ -275,14 +273,14 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
 
         let sidebar_btn = gtk::ToggleButton::new();
         sidebar_btn.set_icon_name("sidebar-show-right-symbolic");
-        sidebar_btn.set_tooltip_text(Some("Toggle sidebar"));
+        sidebar_btn.set_tooltip_text(Some(tr("Toggle sidebar")));
         sidebar_btn.set_active(true);
         let split_for_toggle = split.clone();
         sidebar_btn.connect_toggled(move |btn| {
             split_for_toggle.set_show_sidebar(btn.is_active());
         });
         header.pack_start(&sidebar_btn);
-        cluster_drop.set_tooltip_text(Some("Solana cluster"));
+        cluster_drop.set_tooltip_text(Some(tr("Solana cluster")));
         header.pack_end(&cluster_drop);
         let menu_btn = gtk::MenuButton::new();
         menu_btn.set_icon_name("open-menu-symbolic");
@@ -352,26 +350,26 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
 
 fn signer_title() -> &'static str {
     if env_flag("VIBE_REVEAL") {
-        return "View keys";
+        return tr("View keys");
     }
     if env_flag("VIBE_CREATE") {
-        return "Create wallet";
+        return tr("Create wallet");
     }
     if env_flag("VIBE_IMPORT") {
-        return "Import wallet";
+        return tr("Import wallet");
     }
     let wc = std::env::var("VIBE_WC_REQUEST").unwrap_or_default();
     let swap_out = std::env::var("VIBE_SWAP_OUT").unwrap_or_default();
     let swap_in = std::env::var("VIBE_SWAP_IN").unwrap_or_default();
     let stake = std::env::var("VIBE_STAKE_ACTION").unwrap_or_default();
     if !wc.trim().is_empty() {
-        "Confirm dApp"
+        tr("Confirm dApp")
     } else if !swap_out.trim().is_empty() || !swap_in.trim().is_empty() {
-        "Confirm swap"
+        tr("Confirm swap")
     } else if !stake.trim().is_empty() {
-        "Confirm stake"
+        tr("Confirm stake")
     } else {
-        "Confirm send"
+        tr("Confirm send")
     }
 }
 
@@ -433,9 +431,9 @@ fn capture_window(window: &adw::ApplicationWindow, path: &str) -> Result<(), Str
 
 fn app_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu.append(Some("Lock vault"), Some("app.lock"));
-    menu.append(Some("About VIBE Wallet"), Some("app.about"));
-    menu.append(Some("Quit"), Some("app.quit"));
+    menu.append(Some(tr("Lock vault")), Some("app.lock"));
+    menu.append(Some(tr("About VIBE Wallet")), Some("app.about"));
+    menu.append(Some(tr("Quit")), Some("app.quit"));
     menu
 }
 
@@ -453,7 +451,7 @@ fn build_sidebar(list: &gtk::ListBox) -> gtk::Widget {
 
     let mut first_row: Option<gtk::ListBoxRow> = None;
     for group in NAV {
-        let kicker = gtk::Label::new(Some(group.kicker));
+        let kicker = gtk::Label::new(Some(tr(group.kicker)));
         kicker.add_css_class("og-nav-kicker");
         kicker.set_xalign(0.0);
         let kicker_row = gtk::ListBoxRow::new();
@@ -471,7 +469,7 @@ fn build_sidebar(list: &gtk::ListBox) -> gtk::Widget {
             inner.set_margin_end(8);
             let icon = gtk::Image::from_icon_name(item.icon);
             icon.set_pixel_size(16);
-            let label = gtk::Label::new(Some(item.label));
+            let label = gtk::Label::new(Some(tr(item.label)));
             label.add_css_class("og-nav-label");
             label.set_xalign(0.0);
             label.set_hexpand(true);
@@ -499,7 +497,7 @@ fn nav_label(id: &str) -> Option<&'static str> {
     for group in NAV {
         for item in group.items {
             if item.id == id {
-                return Some(item.label);
+                return Some(tr(item.label));
             }
         }
     }

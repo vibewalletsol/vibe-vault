@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Compact confirm + password sheet. Visual transfer, little copy.
 
 use std::path::PathBuf;
@@ -83,8 +81,34 @@ fn with_budget(ixs: Vec<tx::Instruction>) -> Vec<tx::Instruction> {
     with_budget_units(ixs, 80_000)
 }
 
+/// Priority fee picked in the Confirm window (µ-lamports/CU). `FEE_UNSET` = not picked here
+/// (use the desk's env suggestion; for swaps, let Jupiter decide).
+static CHOSEN_MICRO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(FEE_UNSET);
+const FEE_UNSET: u64 = u64::MAX;
+/// CU budget used to turn a µ-lamport price into Jupiter's `priorityFeeLamports`.
+const SWAP_FEE_UNITS: u32 = 400_000;
+/// Confirm warns above this total priority fee (0.001 SOL) or above this price.
+const CONFIRM_WARN_LAMPORTS: u64 = 1_000_000;
+const CONFIRM_WARN_MICRO: u64 = 1_000_000;
+
+fn chosen_micro() -> Option<u64> {
+    match CHOSEN_MICRO.load(std::sync::atomic::Ordering::SeqCst) {
+        FEE_UNSET => None,
+        v => Some(v),
+    }
+}
+
+fn set_chosen_micro(v: Option<u64>) {
+    CHOSEN_MICRO.store(v.unwrap_or(FEE_UNSET), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Jupiter `priorityFeeLamports` for the Confirm choice (None = Jupiter auto).
+fn swap_priority_lamports() -> Option<u64> {
+    chosen_micro().map(|m| vibe_core::fees::priority_fee_lamports(SWAP_FEE_UNITS, m))
+}
+
 fn with_budget_units(mut ixs: Vec<tx::Instruction>, default_units: u32) -> Vec<tx::Instruction> {
-    let micro = env_u64("VIBE_PRIORITY_MICROLAMPORTS", 25_000);
+    let micro = chosen_micro().unwrap_or_else(|| env_u64("VIBE_PRIORITY_MICROLAMPORTS", 25_000));
     if micro == 0 {
         return ixs;
     }
@@ -222,6 +246,19 @@ fn review_mints(k: Kind) -> Vec<String> {
 
 fn collect_review(k: Kind, rec: vibe_core::store::WalletRecord, rpc: vibe_core::Rpc) -> ReviewPaint {
     let mut paint = ReviewPaint::default();
+    match agent_task_check(&rec) {
+        Ok(Some(task)) => paint.warns.push(format!(
+            "Requested by AI agent “{}” (task {}, {}). Check every detail before you sign.",
+            task.agent_name,
+            task.id,
+            if task.approved_by_human { "approved on the desk" } else { "within its caps" }
+        )),
+        Ok(None) => {}
+        Err(e) => {
+            paint.blocked = Some(e);
+            return paint;
+        }
+    }
     let sol = env_sol_amount(k);
     if let Err(e) = vibe_core::policy::check_max_sol(&rec, sol) {
         paint.blocked = Some(e);
@@ -259,6 +296,15 @@ fn collect_review(k: Kind, rec: vibe_core::store::WalletRecord, rpc: vibe_core::
             Ok(req) => {
                 let reviews = review_wc_request(&req, &rec, &rpc);
                 paint_wc_reviews(&mut paint, &reviews);
+                // 1.9 F8: extra, display-only Anchor IDL lines (never part of the review
+                // or the pre-sign re-check above).
+                let idl = anchor_idl_lines(&req, &rpc);
+                if !idl.is_empty() {
+                    paint.infos.push(
+                        "Anchor IDL decode — names come from the program's own IDL. Display only: the vault checks above are unchanged.".into(),
+                    );
+                    paint.infos.extend(idl);
+                }
             }
             Err(e) => paint.blocked = Some(format!("Blocked by the vault: {e}")),
         }
@@ -290,6 +336,8 @@ fn collect_review(k: Kind, rec: vibe_core::store::WalletRecord, rpc: vibe_core::
             }
         }
     }
+    // 1.9: which RPC this Confirm is using (host only, never the API key).
+    paint.infos.push(format!("RPC · {}", rpc.active_label()));
     paint
 }
 
@@ -328,8 +376,36 @@ fn reload_active_record(ctx: &Ctx) -> Option<vibe_core::store::WalletRecord> {
         .find(|w| w.id == target || w.address == target)
 }
 
+/// 1.9: a Confirm opened for an AI agent task (`VIBE_AGENT_TASK`) is re-checked against the
+/// vault agent policy: agent not revoked, bound to this wallet, same parameters, caps.
+fn agent_task_check(rec: &vibe_core::store::WalletRecord) -> Result<Option<vibe_core::agents::Task>, String> {
+    let task = env_trim("VIBE_AGENT_TASK");
+    if task.is_empty() {
+        return Ok(None);
+    }
+    let flow = match kind() {
+        Kind::Send => "send",
+        Kind::Swap => "swap",
+        Kind::Stake => "stake",
+        Kind::Nonce => "nonce",
+        Kind::Mint => "mint",
+        _ => "other",
+    };
+    vibe_core::agents::verify_for_confirm(&task, &rec.id, flow, |k| env_trim(k))
+        .map(Some)
+        .map_err(|e| format!("Blocked by the vault agent policy: {e}"))
+}
+
+fn agent_record_result(res: &Result<String, String>) {
+    let task = env_trim("VIBE_AGENT_TASK");
+    if !task.is_empty() {
+        let _ = vibe_core::agents::record_result(&task, res.clone());
+    }
+}
+
 fn enforce_vault_rules(ctx: &Ctx, k: Kind, extra_ack: bool) -> Result<(), String> {
     let rec = reload_active_record(ctx).ok_or_else(|| "No wallet in this vault".to_string())?;
+    agent_task_check(&rec)?;
     vibe_core::policy::check_max_sol(&rec, env_sol_amount(k))?;
     vibe_core::policy::check_max_usd(&rec, env_usd_amount())?;
     if !rec.token2022_extra_confirm {
@@ -1048,6 +1124,12 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
     let extra_ack = std::rc::Rc::new(std::cell::Cell::new(false));
     let extra_need = std::rc::Rc::new(std::cell::Cell::new(false));
     let blocked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fee_bad = std::rc::Rc::new(std::cell::Cell::new(false));
+    let fee_box = if k == Kind::Send || k == Kind::Swap {
+        Some(fee_picker(k, fee_bad.clone()))
+    } else {
+        None
+    };
     let extra_box = gtk::CheckButton::with_label(if k == Kind::Wc {
         "I understand the warnings above"
     } else {
@@ -1109,8 +1191,13 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
     let extra_ack_s = extra_ack.clone();
     let extra_need_s = extra_need.clone();
     let blocked_s = blocked.clone();
+    let fee_bad_s = fee_bad.clone();
     let sign = move || {
         if go_s.is_sensitive() == false {
+            return;
+        }
+        if fee_bad_s.get() {
+            status_s.set_text("Fix the priority fee first");
             return;
         }
         if watch {
@@ -1160,6 +1247,9 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
     card.append(&kicker);
     card.append(&flow);
     card.append(&review);
+    if let Some(fb) = &fee_box {
+        card.append(fb);
+    }
     card.append(&extra_box);
     {
         let store = ctx.state.borrow().store.clone();
@@ -1254,6 +1344,149 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
         }
     });
     shell.upcast()
+}
+
+/// Presets + custom µ-lamports for the Send / Swap Confirm. The choice is stored in
+/// `CHOSEN_MICRO`; the vault re-checks the built bytes against R14b before signing.
+fn fee_picker(k: Kind, fee_bad: std::rc::Rc<std::cell::Cell<bool>>) -> gtk::Widget {
+    use vibe_core::fees::{self, FeeVerdict};
+    let units = if k == Kind::Swap {
+        SWAP_FEE_UNITS
+    } else {
+        env_u32("VIBE_COMPUTE_UNITS", 80_000)
+    };
+    let suggested = env_trim("VIBE_PRIORITY_MICROLAMPORTS").parse::<u64>().ok();
+    let mode = env_trim("VIBE_PRIORITY_MODE").to_ascii_lowercase();
+    // (label, value) — None value = Jupiter auto (swap) / custom sentinel handled below.
+    let mut items: Vec<(String, Option<u64>)> = Vec::new();
+    if k == Kind::Swap {
+        items.push(("Auto (Jupiter)".into(), None));
+    } else if let Some(v) = suggested.filter(|v| fees::PRESETS.iter().all(|(_, _, p)| p != v)) {
+        items.push((format!("Suggested · {v} µL"), Some(v)));
+    }
+    for (_, label, micro) in fees::PRESETS {
+        items.push((format!("{label} · {micro} µL"), Some(*micro)));
+    }
+    let custom_idx = items.len() as u32;
+    let mut labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+    labels.push("Custom…");
+    let drop = gtk::DropDown::from_strings(&labels);
+    drop.set_tooltip_text(Some("Priority fee (µ-lamports per compute unit)"));
+    // Preselect: desk preset name, else the desk's number, else Normal / Auto.
+    let pick = if k == Kind::Swap && suggested.is_none() {
+        0
+    } else if let Some(i) = items.iter().position(|(l, _)| {
+        !mode.is_empty() && l.to_ascii_lowercase().starts_with(&mode)
+    }) {
+        i as u32
+    } else if let Some(i) = suggested.and_then(|v| items.iter().position(|(_, x)| *x == Some(v))) {
+        i as u32
+    } else if k == Kind::Swap {
+        0
+    } else {
+        items.iter().position(|(l, _)| l.starts_with("Normal")).unwrap_or(0) as u32
+    };
+    drop.set_selected(pick);
+
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some("µ-lamports per CU, e.g. 50000"));
+    entry.set_input_purpose(gtk::InputPurpose::Digits);
+    entry.set_visible(false);
+    let detail = label_line("", "og-signer-info");
+    let warn = label_line("", "og-signer-warn");
+    warn.set_visible(false);
+
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = gtk::Label::new(Some("Priority fee"));
+    title.add_css_class("og-signer-hint");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    head.append(&title);
+    head.append(&drop);
+
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    col.add_css_class("og-signer-fee");
+    col.append(&head);
+    col.append(&entry);
+    col.append(&detail);
+    col.append(&warn);
+
+    let items = std::rc::Rc::new(items);
+    let refresh = {
+        let drop = drop.clone();
+        let entry = entry.clone();
+        let detail = detail.clone();
+        let warn = warn.clone();
+        let items = items.clone();
+        std::rc::Rc::new(move || {
+            let idx = drop.selected();
+            let custom = idx == custom_idx;
+            entry.set_visible(custom);
+            let micro: Result<Option<u64>, String> = if custom {
+                match fees::parse_micro(&entry.text()) {
+                    Some(v) => Ok(Some(v)),
+                    None => Err("Type a whole number of µ-lamports per CU.".into()),
+                }
+            } else {
+                Ok(items.get(idx as usize).and_then(|(_, v)| *v))
+            };
+            warn.set_visible(false);
+            warn.remove_css_class("og-signer-block");
+            match micro {
+                Err(e) => {
+                    set_chosen_micro(None);
+                    fee_bad.set(true);
+                    detail.set_text("Priority fee · —");
+                    warn.set_text(&e);
+                    warn.add_css_class("og-signer-block");
+                    warn.set_visible(true);
+                }
+                Ok(None) => {
+                    set_chosen_micro(None);
+                    fee_bad.set(false);
+                    detail.set_text("Priority fee · Jupiter picks it (auto, capped by the vault at 0.05 SOL)");
+                }
+                Ok(Some(m)) => {
+                    let verdict = if custom { fees::check_custom(units, m) } else { Ok(fees::check_fee(units, m)) };
+                    let fee = fees::priority_fee_lamports(units, m);
+                    detail.set_text(&if k == Kind::Swap {
+                        format!("{} (sent to Jupiter as a max of {fee} lamports)", fees::describe(units, m))
+                    } else {
+                        fees::describe(units, m)
+                    });
+                    match verdict {
+                        Err(e) | Ok(FeeVerdict::Block(e)) => {
+                            set_chosen_micro(None);
+                            fee_bad.set(true);
+                            warn.set_text(&format!("Blocked by the vault [R14b]: {e}"));
+                            warn.add_css_class("og-signer-block");
+                            warn.set_visible(true);
+                        }
+                        Ok(v) => {
+                            set_chosen_micro(Some(m));
+                            fee_bad.set(false);
+                            let high = matches!(v, FeeVerdict::Warn(_))
+                                || fee > CONFIRM_WARN_LAMPORTS
+                                || m > CONFIRM_WARN_MICRO;
+                            if high {
+                                warn.set_text(&format!(
+                                    "High priority fee: about {:.6} SOL. Most transfers land with Normal.",
+                                    fee as f64 / vibe_core::LAMPORTS_PER_SOL as f64
+                                ));
+                                warn.set_visible(true);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+    refresh();
+    let r = refresh.clone();
+    drop.connect_selected_notify(move |_| r());
+    let r = refresh.clone();
+    entry.connect_changed(move |_| r());
+    col.upcast()
 }
 
 trait IfEmpty {
@@ -1590,6 +1823,7 @@ fn review_wc_request(
         block_infinite_approve: rec.block_infinite_approve,
         contacts: &contacts,
         priority_fee_warn_lamports: txcheck::PRIORITY_FEE_WARN_LAMPORTS,
+        priority_fee_max_lamports: vibe_core::fees::MAX_PRIORITY_FEE_LAMPORTS,
     };
     let fetch = |k: &str| rpc.get_account(k).map_err(|e| e.to_string());
     let block = |text: String| Review {
@@ -1639,6 +1873,49 @@ fn review_wc_request(
         Ok(bytes) if !bytes.is_empty() => vec![txcheck::review_wire(&bytes, &ctx, fetch)],
         _ => vec![block("dApp did not send a readable transaction".into())],
     }
+}
+
+/// 1.9 F8: Anchor instruction names, arguments and account names for the Confirm screen.
+///
+/// DISPLAY ONLY. Called from `collect_review` after the vault review has been painted.
+/// It is deliberately NOT called from `review_wc_request`, which is also the exact-bytes
+/// re-check `run_wc` performs right before signing, so an IDL (or a failure to fetch one)
+/// can never block, unblock or change what gets signed. Any error or panic → no lines, and
+/// the Confirm shows the existing raw decode only.
+fn anchor_idl_lines(req: &serde_json::Value, rpc: &vibe_core::Rpc) -> Vec<String> {
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if method == "solana_signMessage" {
+        return Vec::new();
+    }
+    let raws: Vec<String> = if method == "solana_signAllTransactions" {
+        req.get("transactions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default()
+    } else {
+        req.get("transaction").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default()
+    };
+    let many = raws.len() > 1;
+    let mut out = Vec::new();
+    let Ok(mut reg) = vibe_core::anchor_idl::global().lock() else {
+        return out;
+    };
+    // Bounded: at most 12 reads and 8 s for the whole Confirm, 6 s per HTTP request.
+    let idl_rpc = rpc.clone().with_timeout(6);
+    let mut budget = vibe_core::anchor_idl::FetchBudget::confirm_default();
+    for (n, raw) in raws.iter().enumerate().take(8) {
+        let Ok(bytes) = tx::decode_b64(raw) else { continue };
+        let lines = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vibe_core::anchor_idl::describe_wire(&bytes, &mut reg, |k: &str| {
+                budget.fetch(k, &mut |k: &str| idl_rpc.get_account(k).map_err(|e| e.to_string()))
+            })
+        }))
+        .unwrap_or_default();
+        for l in lines {
+            out.push(if many { format!("Tx {} · {l}", n + 1) } else { l });
+        }
+    }
+    out
 }
 
 fn paint_wc_reviews(paint: &mut ReviewPaint, reviews: &[vibe_core::txcheck::Review]) {
@@ -2069,7 +2346,8 @@ fn run_swap(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
     let slip = ctx.state.borrow().settings.slippage_bps;
     let slip = if slip == 0 { None } else { Some(slip) };
     let key = ctx.state.borrow().settings.jupiter_api_key.clone();
-    let client = jupiter::Client::from_env_or(&key);
+    let mut client = jupiter::Client::from_env_or(&key);
+    client.priority_fee_lamports = swap_priority_lamports();
     let wallet = wallet.clone();
     let addr = wallet.address.clone();
     let ctx_done = ctx.clone();
@@ -2082,6 +2360,11 @@ fn run_swap(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
             let order = client
                 .order(&in_mint, &out_mint, raw, Some(&addr), slip)
                 .map_err(|e| e.to_string())?;
+            // The vault re-reads the fee Jupiter actually put in the bytes (R14b gate runs
+            // again inside sign_order_with); a picked fee is also a ceiling.
+            if let (Some(want), Some(b64)) = (client.priority_fee_lamports, order.transaction_b64.as_deref()) {
+                vibe_core::fees::check_wire_against(b64, want)?;
+            }
             if !order.can_execute() {
                 return Err(if order.error_message.is_empty() {
                     "Jupiter could not build a swap transaction".into()
@@ -3860,6 +4143,7 @@ fn finish(
     in_mint: &str,
     out_mint: &str,
 ) {
+    agent_record_result(&res);
     match res {
         Ok(sig) => {
             let sig = sig.lines().next().unwrap_or(&sig).trim().to_string();

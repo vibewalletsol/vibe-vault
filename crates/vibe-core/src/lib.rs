@@ -1,17 +1,19 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Solana wallet core for VIBE Wallet (no GTK).
 
+pub mod anchor_idl;
 pub mod cluster;
 pub mod coingecko;
 pub mod decode;
 pub mod error;
+pub mod fees;
 pub mod format;
 pub mod hd;
+pub mod i18n;
 pub mod jupiter;
 pub mod keypair;
 pub mod ledger;
 pub mod mcp;
+pub mod agents;
 pub mod trezor;
 pub mod mnemonic;
 pub mod policy;

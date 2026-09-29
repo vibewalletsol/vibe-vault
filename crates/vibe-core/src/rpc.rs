@@ -1,8 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-// Portions derived from Cinder (https://github.com/gregnb/cinder),
-// Copyright (c) 2026 Gregory Nowakowski, MIT License (see LICENSES/MIT-Cinder.txt).
-
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -11,9 +6,114 @@ use crate::{format, LAMPORTS_PER_SOL};
 
 const UA: &str = "VIBEWallet/1.0 (+https://oldgrowthcrypto.com)";
 
-#[derive(Clone, Debug)]
+/// Ordered RPC endpoints with failover (1.9). `url` is the primary (index 0).
+///
+/// Reads fail over on transport errors, HTTP 408/429/5xx/401/403, bad JSON and
+/// "node is behind" style JSON-RPC errors. Sends never re-sign: the same signed bytes
+/// (same signature, same blockhash) go to the next endpoint only after a transport-level
+/// failure, and only after `getSignatureStatuses` on that endpoint shows the signature
+/// has not landed. A JSON-RPC rejection (preflight) is final and is never retried
+/// elsewhere. A fallback endpoint is only used after its genesis hash matches the
+/// expected cluster, so a failover can never hop to another cluster.
+#[derive(Clone)]
 pub struct Rpc {
     pub url: String,
+    endpoints: Vec<String>,
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    expected_genesis: Option<String>,
+    genesis_ok: std::sync::Arc<std::sync::Mutex<Vec<Option<bool>>>>,
+    transport: Transport,
+}
+
+/// Low-level JSON-RPC POST. Swappable for tests.
+pub type Transport = std::sync::Arc<dyn Fn(&str, &Value) -> std::result::Result<Value, Fail> + Send + Sync>;
+
+/// Why one endpoint attempt failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fail {
+    /// Connection, DNS, TLS, timeout, HTTP 408/429/5xx/401/403, bad JSON. The request may
+    /// or may not have reached the node.
+    Transport(String),
+    /// JSON-RPC error object (code, message). The node answered.
+    Rpc(i64, String),
+}
+
+impl std::fmt::Debug for Rpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rpc")
+            .field("url", &self.url)
+            .field("endpoints", &self.endpoints.len())
+            .field("active", &self.active_url())
+            .finish()
+    }
+}
+
+pub const GENESIS_MAINNET: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+pub const GENESIS_DEVNET: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+pub const GENESIS_TESTNET: &str = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY";
+
+/// Only https endpoints (http is allowed for localhost / 127.0.0.1 dev validators).
+pub fn endpoint_allowed(url: &str) -> bool {
+    let u = url.trim();
+    if u.starts_with("https://") && u.len() > 8 {
+        return true;
+    }
+    u.starts_with("http://127.0.0.1") || u.starts_with("http://localhost")
+}
+
+/// Parse a user list (commas, newlines, spaces), keep allowed URLs, drop duplicates.
+pub fn parse_endpoint_list(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in text.split(|c: char| c == ',' || c == '\n' || c == ' ' || c == ';') {
+        let u = part.trim().trim_end_matches('/').to_string();
+        if !u.is_empty() && endpoint_allowed(&u) && !out.contains(&u) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+/// Host part of an endpoint, without any query (API keys stay out of the UI).
+pub fn endpoint_host(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
+}
+
+fn is_retryable_rpc_code(code: i64) -> bool {
+    // -32005 node unhealthy/behind, -32004 block not available, -32016 min context slot,
+    // -32603 internal error, -32009/-32007 slot skipped/ledger jump.
+    matches!(code, -32005 | -32004 | -32016 | -32603 | -32009 | -32007)
+}
+
+fn ureq_transport() -> Transport {
+    ureq_transport_secs(30)
+}
+
+fn ureq_transport_secs(secs: u64) -> Transport {
+    std::sync::Arc::new(move |url: &str, body: &Value| {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(secs))
+            .user_agent(UA)
+            .build();
+        let resp = match agent.post(url).set("Content-Type", "application/json").send_json(body.clone()) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                // Some nodes put a JSON-RPC error in a 4xx body; treat those as answers.
+                if code != 429 && code < 500 && code != 401 && code != 403 && code != 408 {
+                    if let Ok(v) = r.into_json::<Value>() {
+                        if let Some(err) = v.get("error") {
+                            let c = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+                            let m = err.get("message").and_then(|m| m.as_str()).unwrap_or("rpc error");
+                            return Err(Fail::Rpc(c, m.to_string()));
+                        }
+                    }
+                }
+                return Err(Fail::Transport(format!("HTTP {code}")));
+            }
+            Err(e) => return Err(Fail::Transport(e.to_string())),
+        };
+        resp.into_json::<Value>().map_err(|e| Fail::Transport(format!("bad JSON: {e}")))
+    })
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -67,34 +167,165 @@ pub struct Snapshot {
 
 impl Rpc {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+        Self::with_endpoints(url, &[], None)
+    }
+
+    /// Primary + ordered fallbacks. `expected_genesis` = the cluster's genesis hash when
+    /// known (mainnet/devnet/testnet); for a custom cluster it is learned from the primary.
+    pub fn with_endpoints(primary: impl Into<String>, fallbacks: &[String], expected_genesis: Option<&str>) -> Self {
+        let url: String = primary.into();
+        let mut endpoints = vec![url.clone()];
+        for f in fallbacks {
+            let f = f.trim().trim_end_matches('/').to_string();
+            if endpoint_allowed(&f) && !endpoints.iter().any(|e| e.trim_end_matches('/') == f) {
+                endpoints.push(f);
+            }
+        }
+        let n = endpoints.len();
+        Self {
+            url,
+            endpoints,
+            active: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            expected_genesis: expected_genesis.map(|s| s.to_string()),
+            genesis_ok: std::sync::Arc::new(std::sync::Mutex::new(vec![None; n])),
+            transport: ureq_transport(),
+        }
+    }
+
+    /// Test hook: replace the HTTP layer.
+    pub fn with_transport(mut self, t: Transport) -> Self {
+        self.transport = t;
+        self
+    }
+
+    /// Same endpoints and failover state, shorter per-request HTTP timeout (1.9 F8: the
+    /// display-only IDL fetch in the Confirm must not stall the review).
+    pub fn with_timeout(self, secs: u64) -> Self {
+        self.with_transport(ureq_transport_secs(secs.max(1)))
+    }
+
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::SeqCst).min(self.endpoints.len().saturating_sub(1))
+    }
+
+    pub fn active_url(&self) -> String {
+        self.endpoints.get(self.active_index()).cloned().unwrap_or_else(|| self.url.clone())
+    }
+
+    /// "api.mainnet-beta.solana.com (fallback 1 of 2)" — no API keys.
+    pub fn active_label(&self) -> String {
+        let i = self.active_index();
+        let host = endpoint_host(&self.active_url());
+        let n = self.endpoints.len().saturating_sub(1);
+        match (i, n) {
+            (_, 0) => host,
+            (0, n) => format!("{host} (primary, {n} fallback{})", if n == 1 { "" } else { "s" }),
+            (i, n) => format!("{host} (fallback {i} of {n})"),
+        }
+    }
+
+    fn post(&self, idx: usize, method: &str, params: &Value) -> std::result::Result<Value, Fail> {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+        let v = (self.transport)(&self.endpoints[idx], &body)?;
+        if let Some(err) = v.get("error") {
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("rpc error");
+            return Err(Fail::Rpc(code, msg.to_string()));
+        }
+        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// May endpoint `idx` be used? Index 0 always; fallbacks must be on the same cluster.
+    fn cluster_ok(&self, idx: usize) -> bool {
+        if idx == 0 {
+            return true;
+        }
+        if let Some(v) = self.genesis_ok.lock().ok().and_then(|g| g.get(idx).copied().flatten()) {
+            return v;
+        }
+        let want = match &self.expected_genesis {
+            Some(g) => Some(g.clone()),
+            None => self.post(0, "getGenesisHash", &json!([])).ok().and_then(|v| v.as_str().map(|s| s.to_string())),
+        };
+        // Custom cluster with the primary down: we can't prove the fallback is the same chain.
+        let Some(w) = want else { return false };
+        let ok = match self.post(idx, "getGenesisHash", &json!([])) {
+            Ok(v) => v.as_str() == Some(w.as_str()),
+            // Fallback unreachable right now: say no, but don't remember it.
+            Err(_) => return false,
+        };
+        if let Ok(mut g) = self.genesis_ok.lock() {
+            if let Some(slot) = g.get_mut(idx) {
+                *slot = Some(ok);
+            }
+        }
+        ok
+    }
+
+    /// Endpoint order for one call: the active one first, then the rest in list order.
+    fn order(&self) -> Vec<usize> {
+        let n = self.endpoints.len();
+        let a = self.active_index();
+        let mut out = vec![a];
+        out.extend((0..n).filter(|i| *i != a));
+        out
+    }
+
+    fn set_active(&self, idx: usize) {
+        self.active.store(idx, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent(UA)
-            .build();
-        let resp = agent
-            .post(&self.url)
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(|e| Error::Rpc(e.to_string()))?;
-        let v: Value = resp.into_json().map_err(|e| Error::Rpc(e.to_string()))?;
-        if let Some(err) = v.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("rpc error");
-            return Err(Error::msg(explain_rpc_text(msg)));
+        let mut last: Option<Fail> = None;
+        for idx in self.order() {
+            if !self.cluster_ok(idx) {
+                continue;
+            }
+            match self.post(idx, method, &params) {
+                Ok(v) => {
+                    self.set_active(idx);
+                    return Ok(v);
+                }
+                Err(Fail::Rpc(code, msg)) if !is_retryable_rpc_code(code) => {
+                    return Err(Error::msg(explain_rpc_text(&msg)));
+                }
+                Err(f) => last = Some(f),
+            }
         }
-        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+        Err(match last {
+            Some(Fail::Rpc(_, m)) => Error::msg(explain_rpc_text(&m)),
+            Some(Fail::Transport(m)) => Error::Rpc(m),
+            None => Error::Rpc("no usable RPC endpoint (fallbacks are on a different cluster?)".into()),
+        })
+    }
+
+    /// Health of every endpoint: (url, Ok(slot, latency_ms) | Err(reason)). Also checks the
+    /// cluster (genesis hash).
+    pub fn health(&self) -> Vec<(String, std::result::Result<(u64, u128), String>)> {
+        (0..self.endpoints.len())
+            .map(|i| {
+                let t = std::time::Instant::now();
+                let r = self
+                    .post(i, "getSlot", &json!([{ "commitment": "confirmed" }]))
+                    .map_err(|e| match e {
+                        Fail::Transport(m) => m,
+                        Fail::Rpc(c, m) => format!("{m} ({c})"),
+                    })
+                    .and_then(|v| v.as_u64().ok_or_else(|| "no slot".to_string()))
+                    .and_then(|slot| {
+                        if i > 0 && !self.cluster_ok(i) {
+                            Err("different cluster (genesis hash mismatch)".into())
+                        } else {
+                            Ok((slot, t.elapsed().as_millis()))
+                        }
+                    });
+                (self.endpoints[i].clone(), r)
+            })
+            .collect()
     }
 
     pub fn get_balance(&self, address: &str) -> Result<u64> {
@@ -237,22 +468,63 @@ impl Rpc {
         Ok(format!("compute units: {units}\n{logs}"))
     }
 
+    /// Broadcast signed bytes. Failover rules (never double-send):
+    /// * The signature is computed locally from the bytes; every retry sends the identical
+    ///   transaction, so the cluster can land it at most once.
+    /// * A JSON-RPC error (preflight / simulation / blockhash rejection) is final.
+    /// * After a transport failure the next endpoint is first asked whether the signature
+    ///   already exists; if it does, that signature is returned without resending.
+    /// * Nothing here ever fetches a new blockhash or re-signs.
     pub fn send_transaction(&self, tx_bytes: &[u8]) -> Result<String> {
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tx_bytes);
-        let r = self.call(
-            "sendTransaction",
-            json!([
-                b64,
-                {
-                    "encoding": "base64",
-                    "preflightCommitment": "confirmed",
-                    "skipPreflight": false
+        let local_sig = crate::tx::first_signature(tx_bytes).ok().map(|s| bs58::encode(s).into_string());
+        let params = json!([
+            b64,
+            {
+                "encoding": "base64",
+                "preflightCommitment": "confirmed",
+                "skipPreflight": false,
+                "maxRetries": 5
+            }
+        ]);
+        let mut last: Option<String> = None;
+        let mut tried_any = false;
+        for idx in self.order() {
+            if !self.cluster_ok(idx) {
+                continue;
+            }
+            if tried_any {
+                if let Some(sig) = &local_sig {
+                    let seen = self
+                        .post(idx, "getSignatureStatuses", &json!([[sig], { "searchTransactionHistory": false }]))
+                        .ok()
+                        .and_then(|v| v.get("value").and_then(|a| a.as_array()).and_then(|a| a.first().cloned()))
+                        .map(|st| !st.is_null())
+                        .unwrap_or(false);
+                    if seen {
+                        self.set_active(idx);
+                        return Ok(sig.clone());
+                    }
                 }
-            ]),
-        )?;
-        r.as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| Error::Rpc("sendTransaction returned no signature".into()))
+            }
+            tried_any = true;
+            match self.post(idx, "sendTransaction", &params) {
+                Ok(r) => {
+                    self.set_active(idx);
+                    return r
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .or(local_sig.clone())
+                        .ok_or_else(|| Error::Rpc("sendTransaction returned no signature".into()));
+                }
+                Err(Fail::Rpc(_, msg)) => return Err(Error::msg(explain_rpc_text(&msg))),
+                Err(Fail::Transport(m)) => last = Some(m),
+            }
+        }
+        Err(Error::Rpc(format!(
+            "could not reach any RPC to send ({}). The transaction was not re-signed; check History before trying again.",
+            last.unwrap_or_else(|| "no usable endpoint".into())
+        )))
     }
 
     pub fn request_airdrop(&self, address: &str, lamports: u64) -> Result<String> {
@@ -720,6 +992,138 @@ fn explain_sim_err(err: &Value) -> String {
         }
     }
     format!("simulation failed: {err}")
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Fake cluster: `down` hosts fail at transport level; `genesis` per host; `landed`
+    /// tracks signatures the "cluster" has accepted (shared across hosts).
+    fn fake(down: &'static [&'static str], wrong_cluster: &'static [&'static str], log: Log, landed: Arc<Mutex<Vec<String>>>, reject_send: bool) -> Transport {
+        Arc::new(move |url: &str, body: &Value| {
+            let method = body["method"].as_str().unwrap_or("").to_string();
+            log.lock().unwrap().push((endpoint_host(url), method.clone()));
+            if down.iter().any(|d| url.contains(d)) {
+                return Err(Fail::Transport("connection refused".into()));
+            }
+            match method.as_str() {
+                "getGenesisHash" => Ok(json!({"result": if wrong_cluster.iter().any(|d| url.contains(d)) { GENESIS_DEVNET } else { GENESIS_MAINNET }})),
+                "getBalance" => Ok(json!({"result": {"value": 42}})),
+                "getSlot" => Ok(json!({"result": 1000})),
+                "getSignatureStatuses" => {
+                    let sig = body["params"][0][0].as_str().unwrap_or("").to_string();
+                    let hit = landed.lock().unwrap().contains(&sig);
+                    Ok(json!({"result": {"value": [if hit { json!({"err": null}) } else { Value::Null }]}}))
+                }
+                "sendTransaction" => {
+                    if reject_send {
+                        return Ok(json!({"error": {"code": -32002, "message": "Transaction simulation failed: Blockhash not found"}}));
+                    }
+                    let b64 = body["params"][0].as_str().unwrap();
+                    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).unwrap();
+                    let sig = bs58::encode(crate::tx::first_signature(&bytes).unwrap()).into_string();
+                    landed.lock().unwrap().push(sig.clone());
+                    Ok(json!({"result": sig}))
+                }
+                _ => Ok(json!({"result": null})),
+            }
+        })
+    }
+
+    fn rpc(down: &'static [&'static str], wrong: &'static [&'static str], reject: bool) -> (Rpc, Log, Arc<Mutex<Vec<String>>>) {
+        let log: Log = Arc::new(Mutex::new(vec![]));
+        let landed = Arc::new(Mutex::new(vec![]));
+        let r = Rpc::with_endpoints(
+            "https://a.example",
+            &["https://b.example".into(), "https://c.example".into(), "http://evil.example".into()],
+            Some(GENESIS_MAINNET),
+        )
+        .with_transport(fake(down, wrong, log.clone(), landed.clone(), reject));
+        (r, log, landed)
+    }
+
+    fn signed_tx() -> Vec<u8> {
+        let kp = crate::keypair::Keypair::generate();
+        let from = kp.address();
+        let hash = crate::keypair::Keypair::generate().address();
+        crate::tx::build_signed_legacy(&from, &hash, &[crate::tx::system_transfer(&from, &from, 1)], &[&kp]).unwrap()
+    }
+
+    #[test]
+    fn plain_http_fallbacks_are_dropped() {
+        let (r, _, _) = rpc(&[], &[], false);
+        assert_eq!(r.endpoints().len(), 3);
+        assert!(!endpoint_allowed("http://evil.example"));
+        assert!(endpoint_allowed("http://127.0.0.1:8899"));
+        assert_eq!(parse_endpoint_list("https://x.io/, https://x.io\nhttp://bad  https://y.io?api-key=1"), vec!["https://x.io", "https://y.io?api-key=1"]);
+        assert_eq!(endpoint_host("https://y.io/rpc?api-key=SECRET"), "y.io");
+    }
+
+    #[test]
+    fn reads_fail_over_and_stick() {
+        let (r, log, _) = rpc(&["a.example"], &[], false);
+        assert_eq!(r.get_balance("x").unwrap(), 42);
+        assert_eq!(r.active_url(), "https://b.example");
+        assert!(r.active_label().contains("fallback 1 of 2"));
+        log.lock().unwrap().clear();
+        r.get_balance("x").unwrap();
+        // Sticky: next call goes straight to b (genesis already verified, cached).
+        assert_eq!(log.lock().unwrap()[0], ("b.example".into(), "getBalance".into()));
+    }
+
+    #[test]
+    fn never_fails_over_to_another_cluster() {
+        let (r, _, _) = rpc(&["a.example"], &["b.example"], false);
+        r.get_balance("x").unwrap();
+        assert_eq!(r.active_url(), "https://c.example");
+        let h = r.health();
+        assert!(h[0].1.is_err());
+        assert!(h[1].1.as_ref().unwrap_err().contains("different cluster"));
+        assert!(h[2].1.is_ok());
+    }
+
+    #[test]
+    fn send_fails_over_with_identical_bytes_once() {
+        let (r, log, landed) = rpc(&["a.example"], &[], false);
+        let tx = signed_tx();
+        let want = bs58::encode(crate::tx::first_signature(&tx).unwrap()).into_string();
+        assert_eq!(r.send_transaction(&tx).unwrap(), want);
+        assert_eq!(landed.lock().unwrap().as_slice(), &[want.clone()]);
+        let sends = log.lock().unwrap().iter().filter(|(_, m)| m == "sendTransaction").count();
+        assert_eq!(sends, 2); // a (down) + b
+    }
+
+    #[test]
+    fn send_skips_resend_when_signature_already_landed() {
+        // a accepted the tx but the response was lost (modelled: landed before, a down).
+        let (r, log, landed) = rpc(&["a.example"], &[], false);
+        let tx = signed_tx();
+        let sig = bs58::encode(crate::tx::first_signature(&tx).unwrap()).into_string();
+        landed.lock().unwrap().push(sig.clone());
+        assert_eq!(r.send_transaction(&tx).unwrap(), sig);
+        let calls = log.lock().unwrap().clone();
+        assert!(!calls.iter().any(|(h, m)| h == "b.example" && m == "sendTransaction"), "{calls:?}");
+        assert_eq!(landed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_rejection_is_final() {
+        let (r, log, _) = rpc(&[], &[], true);
+        assert!(r.send_transaction(&signed_tx()).is_err());
+        let sends = log.lock().unwrap().iter().filter(|(_, m)| m == "sendTransaction").count();
+        assert_eq!(sends, 1);
+    }
+
+    #[test]
+    fn all_down_says_not_resigned() {
+        let (r, _, _) = rpc(&["a.example", "b.example", "c.example"], &[], false);
+        let e = r.send_transaction(&signed_tx()).unwrap_err().to_string();
+        assert!(e.contains("not re-signed"), "{e}");
+    }
 }
 
 #[cfg(test)]

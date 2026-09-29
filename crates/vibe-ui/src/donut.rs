@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use gtk::prelude::*;
 
 const PALETTE: [(f64, f64, f64); 8] = [

@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use adw::prelude::*;
 
 use crate::ctx::{Ctx, ShellWidgets};
@@ -27,11 +25,11 @@ pub fn build(ctx: &Ctx, shell: &ShellWidgets) -> gtk::Widget {
     title.set_xalign(0.0);
 
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let create = gtk::Button::with_label("Create");
+    let create = gtk::Button::with_label(tr("Create"));
     create.add_css_class("og-primary");
-    let import = gtk::Button::with_label("Import");
+    let import = gtk::Button::with_label(tr("Import"));
     import.add_css_class("og-ghost");
-    let hw = gtk::Button::with_label("Hardware");
+    let hw = gtk::Button::with_label(tr("Hardware"));
     hw.add_css_class("og-ghost");
     let ctx_c = ctx.clone();
     create.connect_clicked(move |_| dialogs::create_wallet(&ctx_c));

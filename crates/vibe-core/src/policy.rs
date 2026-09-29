@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Vault rules the GTK UI cannot skip. Enforced in vibe-vault at sign time.
 
 use crate::store::{self, ContactBook, WalletRecord};

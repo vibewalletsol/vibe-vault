@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-// Portions derived from Cinder (https://github.com/gregnb/cinder),
-// Copyright (c) 2026 Gregory Nowakowski, MIT License (see LICENSES/MIT-Cinder.txt).
 //! Well-known Solana program IDs.
 
 pub struct ProgramIds;

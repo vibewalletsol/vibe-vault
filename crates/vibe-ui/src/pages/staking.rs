@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use adw::prelude::*;
 use vibe_core::{parse_sol, tx};
 
@@ -39,9 +37,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     let form = gtk::Box::new(gtk::Orientation::Vertical, 10);
     form.add_css_class("og-card");
     let vote = gtk::Entry::new();
-    vote.set_placeholder_text(Some("Validator vote address"));
+    vote.set_placeholder_text(Some(tr("Validator vote address")));
     let amount = gtk::Entry::new();
-    amount.set_placeholder_text(Some("Amount in SOL (plus rent)"));
+    amount.set_placeholder_text(Some(tr("Amount in SOL (plus rent)")));
     if let Ok(v) = std::env::var("VIBE_STAKE_VOTE") {
         let v = v.trim().to_string();
         if !v.is_empty() {
@@ -57,9 +55,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
             amount.set_text(&v);
         }
     }
-    let delegate = gtk::Button::with_label("Review delegate");
+    let delegate = gtk::Button::with_label(tr("Review delegate"));
     delegate.add_css_class("og-primary");
-    let everstake = gtk::Button::with_label("Use Everstake");
+    let everstake = gtk::Button::with_label(tr("Use Everstake"));
     everstake.add_css_class("og-ghost");
     let vote_e = vote.clone();
     everstake.connect_clicked(move |_| {
@@ -67,18 +65,18 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     });
 
     let unstake = gtk::Entry::new();
-    unstake.set_placeholder_text(Some("Stake account to unstake or withdraw"));
+    unstake.set_placeholder_text(Some(tr("Stake account to unstake or withdraw")));
     if let Ok(v) = std::env::var("VIBE_UNSTAKE_ACCOUNT") {
         let v = v.trim().to_string();
         if !v.is_empty() {
             unstake.set_text(&v);
         }
     }
-    let deactivate = gtk::Button::with_label("Deactivate (unstake)");
+    let deactivate = gtk::Button::with_label(tr("Deactivate (unstake)"));
     deactivate.add_css_class("og-ghost");
-    let withdraw = gtk::Button::with_label("Withdraw to this wallet");
+    let withdraw = gtk::Button::with_label(tr("Withdraw to this wallet"));
     withdraw.add_css_class("og-ghost");
-    let load = gtk::Button::with_label("Load validators & my stakes");
+    let load = gtk::Button::with_label(tr("Load validators & my stakes"));
     load.add_css_class("og-ghost");
     let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     form.append(&vote);

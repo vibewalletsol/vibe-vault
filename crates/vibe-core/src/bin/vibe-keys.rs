@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Headless key export. JSON on stdin/stdout. No GTK.
 
 use std::io::{Read, Write};

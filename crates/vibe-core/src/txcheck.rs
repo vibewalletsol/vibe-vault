@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Vault-side transaction review: strict legacy/v0 message parsing, Address
 //! Lookup Table (ALT) resolution and the static drainer rules (vault-spec.md §3.2, §4).
 //!
@@ -440,6 +438,8 @@ pub struct RuleCtx<'a> {
     pub contacts: &'a [String],
     /// R14 threshold.
     pub priority_fee_warn_lamports: u64,
+    /// R14b hard cap (BLOCK above this). 0 = use `fees::MAX_PRIORITY_FEE_LAMPORTS`.
+    pub priority_fee_max_lamports: u64,
 }
 
 pub fn known_program(id: &str) -> bool {
@@ -629,6 +629,11 @@ where
                     // Withdraw: [stake, to, clock, history, withdraw authority]
                     4 if acct(ix, 4) == user && acct(ix, 1) != user => out.push(f("R5", Level::Block,
                         format!("Withdraws stake to {}.", acct(ix, 1)))),
+                    // 1.9 F7: SetLockup [stake, authority] / SetLockupChecked [stake, authority, (new custodian)]
+                    // signed by this wallet can freeze the stake until a date or epoch.
+                    6 | 12 if acct(ix, 1) == user => out.push(f("R5b", Level::Warn,
+                        format!("Sets a lockup on stake account {}: until it ends, only the lockup custodian can release it.",
+                            short(acct(ix, 0))))),
                     _ => {}
                 }
             }
@@ -678,9 +683,21 @@ where
             "Vault rule: max {} SOL per tx (this sends {sol:.4} SOL).", ctx.max_sol_per_tx)));
     }
     // R14: priority fee = limit × price / 1e6.
-    let limit = cu_limit.unwrap_or_else(|| (non_budget * 200_000).min(1_400_000)) as u128;
-    let prio = (limit * cu_price as u128 / 1_000_000) as u64;
-    if prio > ctx.priority_fee_warn_lamports {
+    // Same math as `fees::priority_fee_lamports` (runtime clamps the limit to 1.4M, rounds up).
+    let limit = cu_limit.unwrap_or_else(|| non_budget.saturating_mul(crate::fees::DEFAULT_UNITS_PER_IX));
+    let prio = crate::fees::priority_fee_lamports(limit, cu_price);
+    let max_fee = if ctx.priority_fee_max_lamports == 0 {
+        crate::fees::MAX_PRIORITY_FEE_LAMPORTS
+    } else {
+        ctx.priority_fee_max_lamports.min(crate::fees::MAX_PRIORITY_FEE_LAMPORTS)
+    };
+    if prio > max_fee {
+        out.push(f("R14b", Level::Block, format!(
+            "Priority fee is {:.4} SOL ({} µ-lamports/CU). The vault maximum is {:.4} SOL.",
+            prio as f64 / crate::LAMPORTS_PER_SOL as f64,
+            cu_price,
+            max_fee as f64 / crate::LAMPORTS_PER_SOL as f64)));
+    } else if prio > ctx.priority_fee_warn_lamports {
         out.push(f("R14", Level::Warn, format!(
             "Priority fee is {:.4} SOL.", prio as f64 / crate::LAMPORTS_PER_SOL as f64)));
     }
@@ -893,6 +910,7 @@ mod tests {
             block_infinite_approve: true,
             contacts,
             priority_fee_warn_lamports: PRIORITY_FEE_WARN_LAMPORTS,
+            priority_fee_max_lamports: 0,
         }
     }
 
@@ -1134,7 +1152,8 @@ mod tests {
         let mut lim = vec![2u8];
         lim.extend_from_slice(&1_400_000u32.to_le_bytes());
         let mut price = vec![3u8];
-        price.extend_from_slice(&50_000_000u64.to_le_bytes());
+        // 1.4M CU × 10M µL = 0.014 SOL: over the R14 warn line, under the R14b cap.
+        price.extend_from_slice(&10_000_000u64.to_le_bytes());
         let cb = pk(ProgramIds::COMPUTE_BUDGET);
         let m = msg(
             None,
@@ -1147,6 +1166,97 @@ mod tests {
         let got = rules(&r);
         assert!(got.contains(&"R13") && got.contains(&"R14") && got.contains(&"R6"), "{got:?}");
         assert!(!r.blocked() && r.needs_ack());
+    }
+
+    #[test]
+    fn r14b_max_fee_blocks() {
+        let user = rnd();
+        let u = b58(&user);
+        let cb = pk(ProgramIds::COMPUTE_BUDGET);
+        let fee_msg = |price_micro: u64| {
+            let mut lim = vec![2u8];
+            lim.extend_from_slice(&1_400_000u32.to_le_bytes());
+            let mut price = vec![3u8];
+            price.extend_from_slice(&price_micro.to_le_bytes());
+            msg(None, [1, 0, 2], &[user, cb, pk(ProgramIds::MEMO)], &[(1, vec![], lim), (1, vec![], price), (2, vec![], b"hi".to_vec())], &[])
+        };
+        // 1.4M CU × 40M µL = 0.056 SOL, over the 0.05 SOL cap → BLOCK R14b.
+        let r = review_message(&fee_msg(40_000_000), &ctx(&u, &[]), |_| Ok(None));
+        assert!(r.blocked(), "{:?}", rules(&r));
+        assert_eq!(r.first_block().unwrap().rule, "R14b");
+        // 1.4M CU × 10M µL = 0.014 SOL → warn only.
+        let r = review_message(&fee_msg(crate::fees::MAX_MICRO_LAMPORTS), &ctx(&u, &[]), |_| Ok(None));
+        assert!(!r.blocked() && rules(&r).contains(&"R14"));
+        // A lower per-wallet max (policy) is honoured; a higher one is clamped to the vault max.
+        let mut c = ctx(&u, &[]);
+        c.priority_fee_max_lamports = 1_000;
+        let r = review_message(&fee_msg(25_000), &c, |_| Ok(None));
+        assert_eq!(r.first_block().map(|f| f.rule), Some("R14b"));
+        c.priority_fee_max_lamports = u64::MAX;
+        let r = review_message(&fee_msg(40_000_000), &c, |_| Ok(None));
+        assert!(r.blocked());
+    }
+
+    /// 1.9 F7: the vault's own stake flows (Staking → Validators "Stake", Rewards
+    /// "Unstake"/"Withdraw") build exactly these instructions. They must pass the
+    /// rules cleanly and decode with readable names; withdrawing elsewhere still blocks.
+    #[test]
+    fn vault_stake_flows_pass_rules_and_decode() {
+        use crate::tx::{create_account, stake_deactivate, stake_delegate, stake_initialize, stake_withdraw};
+        let user = b58(&rnd());
+        let stake = b58(&rnd());
+        let vote = b58(&rnd());
+        let bh = b58(&rnd());
+        let review = |ixs: Vec<Instruction>| {
+            let m = tx::compile_legacy_message(&user, &bh, &ixs).unwrap();
+            let mut c = ctx(&user, &[]);
+            c.from_dapp = false;
+            review_message(&m, &c, |_| Ok(None))
+        };
+        let create = create_account(&user, &stake, 1_002_282_880, 200, ProgramIds::STAKE).unwrap();
+        let init = stake_initialize(&stake, &user, &user).unwrap();
+        let del = stake_delegate(&stake, &vote, &user);
+        let r = review(vec![create, init, del]);
+        assert!(!r.blocked() && !r.needs_ack(), "{:?}", r.findings);
+        assert!(r.instruction_lines.iter().any(|l| l.contains("Initialize stake")));
+        assert!(r.instruction_lines.iter().any(|l| l.contains("Delegate stake") && l.contains("validator")));
+        let r = review(vec![stake_deactivate(&stake, &user)]);
+        assert!(!r.blocked() && !r.needs_ack(), "{:?}", r.findings);
+        assert!(r.instruction_lines[0].contains("Deactivate stake"));
+        let r = review(vec![stake_withdraw(&stake, &user, &user, 5)]);
+        assert!(!r.blocked() && !r.needs_ack(), "{:?}", r.findings);
+        assert!(r.instruction_lines[0].contains("Withdraw stake") && r.instruction_lines[0].contains("5 lamports"));
+        // Same withdraw, but to someone else: still R5 BLOCK.
+        let thief = b58(&rnd());
+        let r = review(vec![stake_withdraw(&stake, &thief, &user, 5)]);
+        assert_eq!(r.first_block().map(|f| f.rule), Some("R5"));
+    }
+
+    #[test]
+    fn stake_lockup_warns_and_all_stake_ops_have_names() {
+        let user = rnd();
+        let u = b58(&user);
+        let sa = rnd();
+        let stake = pk(ProgramIds::STAKE);
+        // SetLockup: [stake, authority]; LockupArgs = 3 × Option (all Some here)
+        let mut d = 6u32.to_le_bytes().to_vec();
+        d.push(1);
+        d.extend_from_slice(&i64::MAX.to_le_bytes());
+        d.push(0);
+        d.push(0);
+        let m = msg(None, [1, 0, 1], &[user, sa, stake], &[(2, vec![1, 0], d)], &[]);
+        let r = review_message(&m, &ctx(&u, &[]), |_| Ok(None));
+        assert!(rules(&r).contains(&"R5b") && r.needs_ack() && !r.blocked(), "{:?}", r.findings);
+        assert!(r.instruction_lines[0].contains("Set stake lockup"));
+        for op in 0u32..=17 {
+            let ix = Instruction {
+                program_id: ProgramIds::STAKE.into(),
+                accounts: vec![],
+                data: op.to_le_bytes().to_vec(),
+            };
+            let t = crate::decode::decode_instruction(&ix).title;
+            assert_ne!(t, "Stake", "stake op {op} has no name");
+        }
     }
 
     #[test]

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -96,6 +93,9 @@ pub struct Settings {
     /// Optional CoinGecko demo/pro API key.
     #[serde(default)]
     pub coingecko_api_key: String,
+    /// 1.9: ordered fallback RPC endpoints (same cluster), tried after the primary.
+    #[serde(default)]
+    pub rpc_fallbacks: Vec<String>,
 }
 
 fn default_slippage() -> u16 {
@@ -110,6 +110,7 @@ impl Default for Settings {
             slippage_bps: 0,
             jupiter_api_key: String::new(),
             coingecko_api_key: String::new(),
+            rpc_fallbacks: Vec::new(),
         }
     }
 }
@@ -225,7 +226,7 @@ pub fn save_contacts(path: &Path, book: &ContactBook) -> Result<()> {
     write_private(path, &serde_json::to_string_pretty(book)?)
 }
 
-fn write_private(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }

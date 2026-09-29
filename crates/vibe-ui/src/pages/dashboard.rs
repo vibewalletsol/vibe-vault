@@ -1,6 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
-
+use vibe_core::i18n::tr;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -70,9 +68,9 @@ pub fn build(ctx: &Ctx, stack: &gtk::Stack) -> (gtk::Widget, ShellWidgets) {
 
     let cta = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     cta.set_margin_top(8);
-    let refresh = gtk::Button::with_label("Refresh");
+    let refresh = gtk::Button::with_label(tr("Refresh"));
     refresh.add_css_class("og-ghost");
-    let copy = gtk::Button::with_label("Copy address");
+    let copy = gtk::Button::with_label(tr("Copy address"));
     copy.add_css_class("og-ghost");
     let ctx_r = ctx.clone();
     refresh.connect_clicked(move |_| ctx_r.refresh());

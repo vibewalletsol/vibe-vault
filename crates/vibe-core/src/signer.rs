@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-only
-// Copyright (c) 2026 Old Growth Crypto
 //! Software vs hardware vs watch-only signing.
 //! Secrets never leave software wallets; Ledger and Trezor sign on-device.
 
