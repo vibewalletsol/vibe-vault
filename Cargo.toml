@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/vibe-core", "crates/vibe-ui"]
+default-members = ["crates/vibe-ui"]
+
+[workspace.package]
+version = "1.8.1"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Old Growth Crypto"]
+homepage = "https://oldgrowthcrypto.com"
+description = "VIBE Wallet — native Linux Solana vault + net-worth desk (GTK4 / libadwaita)"
+repository = "https://github.com/vibewalletsol/vibe-vault"
