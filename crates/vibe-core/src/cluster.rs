@@ -38,13 +38,15 @@ impl Cluster {
     }
 
     pub fn explorer_tx_url(&self, signature: &str) -> String {
-        let cluster = match self {
-            Cluster::Mainnet => "",
-            Cluster::Devnet => "?cluster=devnet",
-            Cluster::Testnet => "?cluster=testnet",
-            Cluster::Custom(_) => "?cluster=custom",
-        };
-        format!("https://solscan.io/tx/{signature}{cluster}")
+        // Mainnet (and custom mainnet RPCs) open Vibe Explorer. It only indexes mainnet,
+        // so devnet and testnet keep Solscan with the cluster param.
+        match self {
+            Cluster::Devnet => format!("https://solscan.io/tx/{signature}?cluster=devnet"),
+            Cluster::Testnet => format!("https://solscan.io/tx/{signature}?cluster=testnet"),
+            Cluster::Mainnet | Cluster::Custom(_) => {
+                format!("https://vibewallet.net/tx.html?sig={signature}")
+            }
+        }
     }
 
     pub fn from_label(label: &str) -> Self {

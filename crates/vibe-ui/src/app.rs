@@ -79,7 +79,7 @@ fn install_actions(app: &adw::Application) {
         {
             return;
         }
-        let url = format!("https://solscan.io/tx/{sig}");
+        let url = format!("https://vibewallet.net/tx.html?sig={sig}");
         let _ = gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE);
     });
     app.add_action(&open_scan);

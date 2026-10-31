@@ -1611,7 +1611,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibe-core"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "argon2",
  "base64",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "vibe-vault"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-channel",
  "base64",

@@ -4,7 +4,7 @@ members = ["crates/vibe-core", "crates/vibe-ui"]
 default-members = ["crates/vibe-ui"]
 
 [workspace.package]
-version = "1.9.0"
+version = "1.9.1"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Old Growth Crypto"]

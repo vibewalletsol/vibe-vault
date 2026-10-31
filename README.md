@@ -55,7 +55,7 @@ the default Adwaita look.
 ## Verifying a release binary
 
 Each VIBE Wallet release names the tag of this repository it was built from
-(for 1.9.0: `v1.9.0`). Release checksums (`SHA256SUMS`) are signed with the
+(for 1.9.1: `v1.9.1`). Release checksums (`SHA256SUMS`) are signed with the
 Old Growth Crypto release signing key, fingerprint
 `58B0 78BE 5C1D B227 8043  67A7 28EB 45CC 198C 2D3D`, which is attached to each
 [VIBE Wallet release](https://github.com/vibewalletsol/VibeWallet/releases) as

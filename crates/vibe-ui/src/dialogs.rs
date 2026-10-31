@@ -694,7 +694,7 @@ pub fn swap_landed(ctx: &Ctx, signature: &str, pay: &str, recv: &str) {
     let body = format!("{pay} → {recv}\n\n{url}");
     let d = adw::AlertDialog::new(Some("Swap confirmed"), Some(&body));
     d.add_response("close", "Close");
-    d.add_response("solscan", "Open Solscan");
+    d.add_response("solscan", "Open Vibe Explorer");
     d.set_response_appearance("solscan", adw::ResponseAppearance::Suggested);
     d.set_default_response(Some("solscan"));
     let url_c = url.clone();
