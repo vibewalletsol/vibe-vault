@@ -188,6 +188,13 @@ impl Client {
     }
 
     /// Quote (and optionally an assembled transaction when `taker` is set).
+    ///
+    /// A manual slippage or the referral fee can make `/order` answer
+    /// HTTP 400 `Failed to get quotes` for a taker that a bare order still
+    /// fills. Keep the first quote that carries `outAmount` (including
+    /// "insufficient funds"). Only after that rejection, retry once with
+    /// Jupiter's auto slippage and no referral. The taker and priority fee
+    /// stay. Referral stays enabled for pairs that still accept it.
     pub fn order(
         &self,
         input_mint: &str,
@@ -197,28 +204,44 @@ impl Client {
         slippage_bps: Option<u16>,
     ) -> Result<Order> {
         let try_ref = REFERRAL_ENABLED.load(Ordering::Relaxed);
+        self.order_attempts(input_mint, output_mint, amount, taker, slippage_bps, try_ref)
+    }
+
+    fn order_attempts(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u64,
+        taker: Option<&str>,
+        slippage_bps: Option<u16>,
+        with_referral: bool,
+    ) -> Result<Order> {
         match self.order_json(
             input_mint,
             output_mint,
             amount,
             taker,
             slippage_bps,
-            try_ref,
+            with_referral,
         ) {
             Ok(v) => parse_order(v),
-            Err(e) if try_ref && referral_rejected(&e) => {
-                REFERRAL_ENABLED.store(false, Ordering::Relaxed);
-                let v = self.order_json(
-                    input_mint,
-                    output_mint,
-                    amount,
-                    taker,
-                    slippage_bps,
-                    false,
-                )?;
-                parse_order(v)
-            }
-            Err(e) => Err(e),
+            Err(e) => match next_order_attempt(&e, slippage_bps, with_referral) {
+                OrderRetry::None => Err(e),
+                OrderRetry::DropReferral => {
+                    REFERRAL_ENABLED.store(false, Ordering::Relaxed);
+                    self.order_attempts(
+                        input_mint,
+                        output_mint,
+                        amount,
+                        taker,
+                        slippage_bps,
+                        false,
+                    )
+                }
+                OrderRetry::Bare => self
+                    .order_json(input_mint, output_mint, amount, taker, None, false)
+                    .and_then(parse_order),
+            },
         }
     }
 
@@ -380,6 +403,34 @@ fn referral_rejected(err: &Error) -> bool {
     text.contains("referralaccount") || text.contains("referral account")
 }
 
+/// Jupiter's blanket rejection when a constrained `/order` (manual slippage,
+/// referral fee, or both) finds no competing route. A bare order can still work.
+fn quotes_rejected(err: &Error) -> bool {
+    err.to_string().to_lowercase().contains("failed to get quotes")
+}
+
+fn slippage_is_set(slippage_bps: Option<u16>) -> bool {
+    slippage_bps.filter(|b| *b > 0).is_some()
+}
+
+enum OrderRetry {
+    None,
+    /// Jupiter named the referral account. Drop it and remember that.
+    DropReferral,
+    /// Drop manual slippage and the referral fee together. One shot.
+    Bare,
+}
+
+fn next_order_attempt(err: &Error, slippage_bps: Option<u16>, with_referral: bool) -> OrderRetry {
+    if with_referral && referral_rejected(err) {
+        return OrderRetry::DropReferral;
+    }
+    if (slippage_is_set(slippage_bps) || with_referral) && quotes_rejected(err) {
+        return OrderRetry::Bare;
+    }
+    OrderRetry::None
+}
+
 fn json_f64(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|n| n.as_f64().or_else(|| n.as_str()?.parse().ok()))
 }
@@ -462,5 +513,41 @@ mod tests {
         let msg = http_fail_msg(422, "Invalid signature for transaction").to_string();
         assert!(msg.contains("stale") || msg.contains("signature slot"), "{msg}");
         assert!(!msg.contains("HTTP 422"));
+    }
+
+    #[test]
+    fn quote_400_retries_once_without_slippage_or_referral() {
+        let rejected = Error::msg("jupiter HTTP 400: Failed to get quotes");
+        assert!(matches!(
+            next_order_attempt(&rejected, Some(50), true),
+            OrderRetry::Bare
+        ));
+        assert!(matches!(
+            next_order_attempt(&rejected, Some(50), false),
+            OrderRetry::Bare
+        ));
+        assert!(matches!(
+            next_order_attempt(&rejected, None, true),
+            OrderRetry::Bare
+        ));
+        // Already bare: do not loop.
+        assert!(matches!(
+            next_order_attempt(&rejected, None, false),
+            OrderRetry::None
+        ));
+        assert!(matches!(
+            next_order_attempt(&rejected, Some(0), false),
+            OrderRetry::None
+        ));
+        // A named referral-account error still drops only the fee.
+        let referral = Error::msg("jupiter HTTP 400: referralAccount is invalid");
+        assert!(matches!(
+            next_order_attempt(&referral, Some(50), true),
+            OrderRetry::DropReferral
+        ));
+        assert!(matches!(
+            next_order_attempt(&Error::msg("jupiter HTTP 401: Unauthorized"), Some(50), true),
+            OrderRetry::None
+        ));
     }
 }

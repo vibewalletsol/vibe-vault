@@ -370,10 +370,7 @@ pub fn token_account_withheld(data: &[u8]) -> u64 {
 pub fn harvest_withheld_to_mint(mint: &str, account: &str, token_program: &str) -> Instruction {
     Instruction {
         program_id: token_program.to_string(),
-        accounts: vec![
-            AccountMeta::writable(mint),
-            AccountMeta::writable(account),
-        ],
+        accounts: vec![AccountMeta::writable(mint), AccountMeta::writable(account)],
         data: vec![26, 3],
     }
 }
@@ -527,7 +524,12 @@ pub fn nonce_advance(nonce_account: &str, authority: &str) -> Instruction {
 }
 
 /// System WithdrawNonceAccount (index 5).
-pub fn nonce_withdraw(nonce_account: &str, authority: &str, dest: &str, lamports: u64) -> Instruction {
+pub fn nonce_withdraw(
+    nonce_account: &str,
+    authority: &str,
+    dest: &str,
+    lamports: u64,
+) -> Instruction {
     let mut data = Vec::with_capacity(12);
     data.extend_from_slice(&encode_u32(5));
     data.extend_from_slice(&encode_u64(lamports));
@@ -561,7 +563,11 @@ pub fn nonce_initialize(nonce_account: &str, authority: &str) -> Result<Instruct
 }
 
 /// System AuthorizeNonceAccount (index 7).
-pub fn nonce_authorize(nonce_account: &str, authority: &str, new_authority: &str) -> Result<Instruction> {
+pub fn nonce_authorize(
+    nonce_account: &str,
+    authority: &str,
+    new_authority: &str,
+) -> Result<Instruction> {
     let mut data = Vec::new();
     data.extend_from_slice(&encode_u32(7));
     data.extend_from_slice(&decode_pubkey(new_authority)?);
@@ -1169,6 +1175,29 @@ fn message_signer_keys(message: &[u8], n_sigs: usize) -> Result<Vec<[u8; 32]>> {
     if message.is_empty() {
         return Err(Error::msg("transaction message truncated"));
     }
+    if message[0] == crate::txcheck::V1_PREFIX {
+        if message.len() < 42 {
+            return Err(Error::msg("transaction message truncated"));
+        }
+        let n_required = message[1] as usize;
+        let n_keys = message[41] as usize;
+        let take = n_sigs.min(n_required).min(n_keys);
+        if take == 0 {
+            return Err(Error::msg("transaction has no signers"));
+        }
+        let mut offset = 42usize;
+        let mut keys = Vec::with_capacity(take);
+        for _ in 0..take {
+            if offset + 32 > message.len() {
+                return Err(Error::msg("transaction keys truncated"));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&message[offset..offset + 32]);
+            keys.push(key);
+            offset += 32;
+        }
+        return Ok(keys);
+    }
     let mut offset = if message[0] & 0x80 != 0 { 1 } else { 0 };
     if offset + 3 > message.len() {
         return Err(Error::msg("transaction message truncated"));
@@ -1193,23 +1222,46 @@ fn message_signer_keys(message: &[u8], n_sigs: usize) -> Result<Vec<[u8; 32]>> {
     Ok(keys)
 }
 
-/// Sign a serialized (legacy or v0) transaction in place.
+/// Sign a serialized (legacy, v0, or v1) transaction in place.
 ///
 /// Jupiter DFlow / RFQ orders often have more than one signature slot. The
 /// wallet must sign the slot that matches its pubkey — not always slot 0.
+/// Version 1 keeps that slot at the tail and signs every byte before it.
 pub fn sign_wire_transaction(tx: &mut [u8], keypair: &Keypair) -> Result<()> {
     let pk = keypair.public_bytes();
     sign_wire_transaction_with(tx, &pk, |msg| Ok(keypair.sign(msg)))
 }
 
-pub fn sign_wire_transaction_with<F>(
-    tx: &mut [u8],
-    pubkey: &[u8; 32],
-    mut sign: F,
-) -> Result<()>
+fn sign_v1_wire<F>(tx: &mut [u8], pubkey: &[u8; 32], mut sign: F) -> Result<()>
 where
     F: FnMut(&[u8]) -> Result<[u8; 64]>,
 {
+    let (n_sigs, message) = crate::txcheck::split_wire(tx).map_err(Error::msg)?;
+    let message = message.to_vec();
+    crate::txcheck::parse_message(&message).map_err(Error::msg)?;
+    crate::fees::check_message(&message).map_err(Error::msg)?;
+    let keys = message_signer_keys(&message, n_sigs)?;
+    let slot = keys
+        .iter()
+        .position(|k| k == pubkey)
+        .ok_or_else(|| Error::msg("this wallet is not a signer on the swap transaction"))?;
+    let sig = sign(&message)?;
+    let start = message.len() + slot * 64;
+    let end = start + 64;
+    if end > tx.len() {
+        return Err(Error::msg("transaction signature slot out of range"));
+    }
+    tx[start..end].copy_from_slice(&sig);
+    Ok(())
+}
+
+pub fn sign_wire_transaction_with<F>(tx: &mut [u8], pubkey: &[u8; 32], mut sign: F) -> Result<()>
+where
+    F: FnMut(&[u8]) -> Result<[u8; 64]>,
+{
+    if tx.first() == Some(&crate::txcheck::V1_PREFIX) {
+        return sign_v1_wire(tx, pubkey, sign);
+    }
     let mut offset = 0;
     let n_sigs = compact_u16_decode(tx, &mut offset)? as usize;
     if n_sigs == 0 {
@@ -1239,6 +1291,20 @@ where
 }
 
 pub fn first_signature(tx: &[u8]) -> Result<[u8; 64]> {
+    if tx.first() == Some(&crate::txcheck::V1_PREFIX) {
+        let (n_sigs, message) = crate::txcheck::split_wire(tx).map_err(Error::msg)?;
+        if n_sigs == 0 {
+            return Err(Error::msg("transaction has no signature slots"));
+        }
+        let start = message.len();
+        let end = start + 64;
+        if end > tx.len() {
+            return Err(Error::msg("transaction truncated"));
+        }
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&tx[start..end]);
+        return Ok(sig);
+    }
     let mut offset = 0;
     let n_sigs = compact_u16_decode(tx, &mut offset)? as usize;
     if n_sigs == 0 {
@@ -1310,14 +1376,27 @@ mod tests {
         let from = kp.address();
         let to = Keypair::generate().address();
         let hash = Keypair::generate().address();
-        let ok = [set_compute_unit_limit(80_000), set_compute_unit_price(25_000), system_transfer(&from, &to, 1)];
+        let ok = [
+            set_compute_unit_limit(80_000),
+            set_compute_unit_price(25_000),
+            system_transfer(&from, &to, 1),
+        ];
         assert!(build_signed_legacy(&from, &hash, &ok, &[&kp]).is_ok());
-        let bad = [set_compute_unit_limit(1_400_000), set_compute_unit_price(40_000_000), system_transfer(&from, &to, 1)];
-        let e = build_signed_legacy(&from, &hash, &bad, &[&kp]).unwrap_err().to_string();
+        let bad = [
+            set_compute_unit_limit(1_400_000),
+            set_compute_unit_price(40_000_000),
+            system_transfer(&from, &to, 1),
+        ];
+        let e = build_signed_legacy(&from, &hash, &bad, &[&kp])
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("R14b"), "{e}");
         // Same gate on the wire-signing path (Jupiter / dApp transactions).
         let mut wire = unsigned_legacy(&from, &hash, &bad).unwrap();
-        assert!(sign_wire_transaction(&mut wire, &kp).unwrap_err().to_string().contains("R14b"));
+        assert!(sign_wire_transaction(&mut wire, &kp)
+            .unwrap_err()
+            .to_string()
+            .contains("R14b"));
         let mut wire = unsigned_legacy(&from, &hash, &ok).unwrap();
         assert!(sign_wire_transaction(&mut wire, &kp).is_ok());
     }
@@ -1454,8 +1533,9 @@ mod tests {
         assert_eq!(decode_pubkey(&a).unwrap().len(), 32);
         let t22 = associated_token_address(&owner, &mint, ProgramIds::TOKEN_2022).unwrap();
         assert_ne!(a, t22);
-        let other = associated_token_address(&Keypair::generate().address(), &mint, ProgramIds::TOKEN)
-            .unwrap();
+        let other =
+            associated_token_address(&Keypair::generate().address(), &mint, ProgramIds::TOKEN)
+                .unwrap();
         assert_ne!(a, other);
     }
 
@@ -1475,7 +1555,11 @@ mod tests {
         sign_wire_transaction(&mut tx, &from).unwrap();
         let sig = first_signature(&tx).unwrap();
         let msg_start = off + 64;
-        assert!(Keypair::verify(&from.public_bytes(), &tx[msg_start..], &sig));
+        assert!(Keypair::verify(
+            &from.public_bytes(),
+            &tx[msg_start..],
+            &sig
+        ));
     }
 
     #[test]
@@ -1515,7 +1599,9 @@ mod tests {
         let bh = Keypair::generate().address();
         let ix = system_transfer(&from.address(), &to.address(), 1_000);
         let mut tx = build_signed_legacy(&from.address(), &bh, &[ix], &[&from]).unwrap();
-        let err = sign_wire_transaction(&mut tx, &other).unwrap_err().to_string();
+        let err = sign_wire_transaction(&mut tx, &other)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a signer"));
     }
 
@@ -1581,8 +1667,8 @@ mod tests {
     fn metadata_pointer_and_token_metadata_encode() {
         let mint = Keypair::generate();
         let auth = Keypair::generate();
-        let ptr = initialize_metadata_pointer(&mint.address(), &auth.address(), &mint.address())
-            .unwrap();
+        let ptr =
+            initialize_metadata_pointer(&mint.address(), &auth.address(), &mint.address()).unwrap();
         assert_eq!(ptr.data[0], METADATA_POINTER_IX);
         assert_eq!(ptr.data[1], 0);
         assert_eq!(&ptr.data[2..34], &auth.public_bytes());
@@ -1609,8 +1695,7 @@ mod tests {
         .unwrap();
         assert_eq!(&field.data[..8], &TOKEN_METADATA_UPDATE_FIELD);
         assert_eq!(field.data[8], 3);
-        let seal =
-            update_token_metadata_authority(&mint.address(), &auth.address(), None).unwrap();
+        let seal = update_token_metadata_authority(&mint.address(), &auth.address(), None).unwrap();
         assert_eq!(&seal.data[..8], &TOKEN_METADATA_UPDATE_AUTHORITY);
         assert_eq!(&seal.data[8..], &[0u8; 32]);
         assert_eq!(
@@ -1618,8 +1703,7 @@ mod tests {
             165 + 1 + 4 + 64
         );
         assert!(
-            token_metadata_tlv_len("Vibe", "VIBE", "https://example.com/meta.json", &[])
-                > 4 + 64
+            token_metadata_tlv_len("Vibe", "VIBE", "https://example.com/meta.json", &[]) > 4 + 64
         );
         assert!(
             token_2022_mint_rent_space(

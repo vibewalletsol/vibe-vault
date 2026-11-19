@@ -25,7 +25,7 @@ not part of this repository and is distributed separately under its own terms.
 
 ## Build
 
-Tested on Ubuntu 24.04 with Rust 1.90.0.
+Tested on Ubuntu 24.04 with Rust 1.90.0. The 1.9.1-1 release binaries were built on Ubuntu 26.04 with Rust 1.95.0.
 
 ```sh
 # Build dependencies (Debian/Ubuntu 24.04 or newer)
@@ -55,7 +55,7 @@ the default Adwaita look.
 ## Verifying a release binary
 
 Each VIBE Wallet release names the tag of this repository it was built from
-(for 1.9.1: `v1.9.1`). Release checksums (`SHA256SUMS`) are signed with the
+(for 1.9.1: `v1.9.1-1`). Release checksums (`SHA256SUMS`) are signed with the
 Old Growth Crypto release signing key, fingerprint
 `58B0 78BE 5C1D B227 8043  67A7 28EB 45CC 198C 2D3D`, which is attached to each
 [VIBE Wallet release](https://github.com/vibewalletsol/VibeWallet/releases) as

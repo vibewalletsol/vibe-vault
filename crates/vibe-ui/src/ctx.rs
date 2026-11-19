@@ -3,9 +3,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use vibe_core::rpc::{Rpc, Snapshot, StakeAccount, Validator};
-use vibe_core::store::{
-    self, ContactBook, Settings, WalletRecord, WalletStore,
-};
+use vibe_core::store::{self, ContactBook, Settings, WalletRecord, WalletStore};
 use vibe_core::{Cluster, Keypair};
 
 use crate::task;
@@ -13,7 +11,11 @@ use crate::task;
 static RPC_CACHE: std::sync::Mutex<Option<(String, Rpc)>> = std::sync::Mutex::new(None);
 
 fn shared_rpc(primary: &str, fallbacks: &[String], genesis: Option<&str>) -> Rpc {
-    let key = format!("{primary}|{}|{}", fallbacks.join(","), genesis.unwrap_or(""));
+    let key = format!(
+        "{primary}|{}|{}",
+        fallbacks.join(","),
+        genesis.unwrap_or("")
+    );
     let mut g = RPC_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((k, r)) = g.as_ref() {
         if *k == key {
@@ -52,6 +54,14 @@ impl Unlocked {
         if let Some(kp) = &self.keypair {
             return Ok(kp.sign(message));
         }
+        if message.first() == Some(&vibe_core::txcheck::V1_PREFIX) {
+            if self.kind() == vibe_core::WalletKeyType::Ledger {
+                return Err("A Ledger cannot sign a version 1 transaction yet. Use the vault on this computer.".into());
+            }
+            if self.kind() == vibe_core::WalletKeyType::Trezor {
+                return Err("A Trezor cannot sign a version 1 transaction yet. Use the vault on this computer.".into());
+            }
+        }
         if self.kind() == vibe_core::WalletKeyType::Ledger {
             let path = if self.derivation_path.is_empty() {
                 vibe_core::ledger::DEFAULT_PATH
@@ -68,7 +78,8 @@ impl Unlocked {
             } else {
                 self.hw_device_id.clone()
             };
-            return vibe_core::ledger::sign_message(&device, path, message).map_err(|e| e.to_string());
+            return vibe_core::ledger::sign_message(&device, path, message)
+                .map_err(|e| e.to_string());
         }
         if self.kind() == vibe_core::WalletKeyType::Trezor {
             let path = if self.derivation_path.is_empty() {
@@ -82,11 +93,52 @@ impl Unlocked {
                     .into_iter()
                     .next()
                     .map(|d| d.path)
-                    .ok_or_else(|| "Plug in a Trezor Safe 3 / T and quit Trezor Suite if it has the device".to_string())?
+                    .ok_or_else(|| {
+                        "Plug in a Trezor Safe 3 / T and quit Trezor Suite if it has the device"
+                            .to_string()
+                    })?
             } else {
                 self.hw_device_id.clone()
             };
-            return vibe_core::trezor::sign_message(&device, path, message).map_err(|e| e.to_string());
+            return vibe_core::trezor::sign_message(&device, path, message)
+                .map_err(|e| e.to_string());
+        }
+        if self.kind().is_watch() {
+            return Err("Watch-only account — it cannot sign".into());
+        }
+        Err("This account cannot sign".into())
+    }
+
+    /// Sign an already-built version 1 off-chain message.
+    /// Ledger uses the Solana app's off-chain instruction so the stick can show the text.
+    pub fn sign_offchain(&self, message: &[u8]) -> Result<[u8; 64], String> {
+        if let Some(kp) = &self.keypair {
+            return Ok(kp.sign(message));
+        }
+        if self.kind() == vibe_core::WalletKeyType::Ledger {
+            let path = if self.derivation_path.is_empty() {
+                vibe_core::ledger::DEFAULT_PATH
+            } else {
+                self.derivation_path.as_str()
+            };
+            let device = if self.hw_device_id.is_empty() {
+                vibe_core::ledger::scan_devices()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .next()
+                    .map(|d| d.path)
+                    .ok_or_else(|| "Plug in a Ledger with the Solana app open".to_string())?
+            } else {
+                self.hw_device_id.clone()
+            };
+            return vibe_core::ledger::sign_offchain_message(&device, path, message)
+                .map_err(|e| e.to_string());
+        }
+        if self.kind() == vibe_core::WalletKeyType::Trezor {
+            return Err(
+                "A Trezor cannot clear-sign this message yet. Use the vault on this computer, or a Ledger with Solana app 1.14 or newer."
+                    .into(),
+            );
         }
         if self.kind().is_watch() {
             return Err("Watch-only account — it cannot sign".into());
@@ -256,7 +308,9 @@ impl Ctx {
                 vibe_core::format_sol(snap.lamports),
                 vibe_core::shorten_address(&snap.address)
             ));
-            shell.address.set_text(&vibe_core::shorten_address(&snap.address));
+            shell
+                .address
+                .set_text(&vibe_core::shorten_address(&snap.address));
             shell.address.set_tooltip_text(Some(&snap.address));
             shell.chip.set_text(cluster.as_label());
             if matches!(cluster, Cluster::Devnet | Cluster::Testnet) {
@@ -266,17 +320,18 @@ impl Ctx {
             }
             apply_change_label(&shell.hero_chg, snap.change_24h);
             apply_change_label(&shell.metric_day, snap.change_24h);
-            shell.metric_sol.set_text(&format!(
-                "{} SOL",
-                vibe_core::format_sol(snap.lamports)
-            ));
+            shell
+                .metric_sol
+                .set_text(&format!("{} SOL", vibe_core::format_sol(snap.lamports)));
             let token_usd: f64 = snap
                 .holdings
                 .iter()
                 .filter(|h| h.coin_id != "solana")
                 .map(|h| h.value_usd)
                 .sum();
-            shell.metric_tokens.set_text(&vibe_core::format_usd(token_usd));
+            shell
+                .metric_tokens
+                .set_text(&vibe_core::format_usd(token_usd));
             shell.hint.set_text(&format!(
                 "{} coins · epoch {} · slot {}",
                 snap.holdings.len(),

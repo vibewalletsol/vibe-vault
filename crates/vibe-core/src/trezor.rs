@@ -94,6 +94,11 @@ pub fn encode_solana_get_address(path: &str, show_display: bool) -> Result<Vec<u
 }
 
 pub fn encode_solana_sign_tx(path: &str, message: &[u8]) -> Result<Vec<u8>> {
+    if message.first() == Some(&crate::txcheck::V1_PREFIX) {
+        return Err(Error::msg(
+            "A Trezor cannot sign a version 1 transaction yet. Use the vault on this computer.",
+        ));
+    }
     let mut out = Vec::new();
     for idx in encode_address_n(path)? {
         proto_put_varint(&mut out, 1, idx as u64);
@@ -212,9 +217,13 @@ fn parse_features(payload: &[u8]) -> Features {
         for (field, value) in fields {
             match (field, value) {
                 (5, ProtoVal::Varint(v)) => feat.bootloader = v != 0,
-                (10, ProtoVal::Bytes(raw)) => feat.label = String::from_utf8_lossy(raw).into_owned(),
+                (10, ProtoVal::Bytes(raw)) => {
+                    feat.label = String::from_utf8_lossy(raw).into_owned()
+                }
                 (12, ProtoVal::Varint(v)) => feat.initialized = Some(v != 0),
-                (21, ProtoVal::Bytes(raw)) => feat.model = String::from_utf8_lossy(raw).into_owned(),
+                (21, ProtoVal::Bytes(raw)) => {
+                    feat.model = String::from_utf8_lossy(raw).into_owned()
+                }
                 (36, ProtoVal::Varint(v)) => feat.passphrase_on_device = v != 0,
                 (44, ProtoVal::Bytes(raw)) => {
                     feat.internal_model = String::from_utf8_lossy(raw).into_owned();
@@ -261,7 +270,10 @@ fn model_from_ids(vid: u16, pid: u16, product: &str, feat: Option<&Features>) ->
         "Trezor Safe 5".into()
     } else if p.contains("safe 3") || p.contains("safe3") {
         "Trezor Safe 3".into()
-    } else if p.contains("model t") || p == "trezor t" || (vid == TREZOR_T_VID && p.contains("trezor t")) {
+    } else if p.contains("model t")
+        || p == "trezor t"
+        || (vid == TREZOR_T_VID && p.contains("trezor t"))
+    {
         "Trezor T".into()
     } else if vid == TREZOR_ONE_VID || p.contains("trezor one") {
         "Trezor One".into()
@@ -473,14 +485,20 @@ impl Session {
     fn initialize(&mut self) -> Result<Features> {
         let (ty, body) = self.call(MSG_INITIALIZE, &[], Duration::from_secs(8))?;
         if ty != MSG_FEATURES {
-            return Err(Error::msg("Trezor did not return Features — unlock it and try again"));
+            return Err(Error::msg(
+                "Trezor did not return Features — unlock it and try again",
+            ));
         }
         let feat = parse_features(&body);
         if feat.bootloader {
-            return Err(Error::msg("Trezor is in bootloader — open the wallet firmware"));
+            return Err(Error::msg(
+                "Trezor is in bootloader — open the wallet firmware",
+            ));
         }
         if feat.initialized == Some(false) {
-            return Err(Error::msg("Trezor has no seed — set it up in Trezor Suite first"));
+            return Err(Error::msg(
+                "Trezor has no seed — set it up in Trezor Suite first",
+            ));
         }
         self.passphrase_on_device = feat.passphrase_on_device;
         Ok(feat)
@@ -533,18 +551,17 @@ fn resolve_path(device_path: &str) -> Result<String> {
         return Ok(want.to_string());
     }
     let devices = scan_devices()?;
-    if let Some(hit) = devices.iter().find(|d| {
-        !want.is_empty() && (d.path == want || d.hidraw == want || d.serial == want)
-    }) {
+    if let Some(hit) = devices
+        .iter()
+        .find(|d| !want.is_empty() && (d.path == want || d.hidraw == want || d.serial == want))
+    {
         return Ok(hit.path.clone());
     }
-    devices
-        .into_iter()
-        .next()
-        .map(|d| d.path)
-        .ok_or_else(|| {
-            Error::msg("Plug in a Trezor Safe 3 / T, unlock it, and quit Trezor Suite if it has the device")
-        })
+    devices.into_iter().next().map(|d| d.path).ok_or_else(|| {
+        Error::msg(
+            "Plug in a Trezor Safe 3 / T, unlock it, and quit Trezor Suite if it has the device",
+        )
+    })
 }
 
 fn open_hid(path: &str) -> Result<Handle> {
@@ -715,7 +732,12 @@ fn normalize_packet(raw: &[u8]) -> Option<[u8; PACKET]> {
     Some(pkt)
 }
 
-fn usb_bulk(file: &File, ep: u32, buf: &mut [u8], timeout_ms: u32) -> std::result::Result<usize, String> {
+fn usb_bulk(
+    file: &File,
+    ep: u32,
+    buf: &mut [u8],
+    timeout_ms: u32,
+) -> std::result::Result<usize, String> {
     let mut xfer = sys::UsbdevfsBulkTransfer {
         ep,
         len: buf.len() as u32,
@@ -903,6 +925,14 @@ mod tests {
             .collect();
         assert_eq!(nums.len(), 4);
         assert_eq!(nums[0], (44 | HARDENED) as u64);
+    }
+
+    #[test]
+    fn v1_transaction_is_refused_before_protobuf() {
+        let err = encode_solana_sign_tx("m/44'/501'/0'/0'", &[0x81, 1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version 1"), "{err}");
     }
 
     #[test]

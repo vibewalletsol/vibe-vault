@@ -21,8 +21,12 @@ const PACKET: usize = 64;
 const CLA: u8 = 0xE0;
 const INS_GET_PUBKEY: u8 = 0x05;
 const INS_SIGN: u8 = 0x06;
+const INS_SIGN_OFFCHAIN: u8 = 0x07;
+const P1_CONFIRM: u8 = 0x01;
 const P2_LAST: u8 = 0x00;
+const P2_EXTEND: u8 = 0x01;
 const P2_MORE: u8 = 0x02;
+const OFFCHAIN_CHUNK: usize = 255;
 const HARDENED: u32 = 0x8000_0000;
 
 #[derive(Clone, Debug)]
@@ -48,12 +52,23 @@ pub fn encode_derivation_path(path: &str) -> Result<Vec<u8>> {
 
 pub fn build_get_pubkey_apdu(path: &str, display: bool) -> Result<Vec<u8>> {
     let deriv = encode_derivation_path(path)?;
-    let mut apdu = vec![CLA, INS_GET_PUBKEY, if display { 1 } else { 0 }, 0, deriv.len() as u8];
+    let mut apdu = vec![
+        CLA,
+        INS_GET_PUBKEY,
+        if display { 1 } else { 0 },
+        0,
+        deriv.len() as u8,
+    ];
     apdu.extend_from_slice(&deriv);
     Ok(apdu)
 }
 
 pub fn build_sign_apdus(path: &str, message: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if message.first() == Some(&crate::txcheck::V1_PREFIX) {
+        return Err(Error::msg(
+            "A Ledger cannot sign a version 1 transaction yet. Use the vault on this computer.",
+        ));
+    }
     let deriv = encode_derivation_path(path)?;
     let first_max = 255usize.saturating_sub(1 + deriv.len());
     let mut out = Vec::new();
@@ -81,7 +96,50 @@ pub fn build_sign_apdus(path: &str, message: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 fn sign_apdu(data: &[u8], last: bool) -> Vec<u8> {
-    let mut apdu = vec![CLA, INS_SIGN, 0x01, if last { P2_LAST } else { P2_MORE }, data.len() as u8];
+    let mut apdu = vec![
+        CLA,
+        INS_SIGN,
+        P1_CONFIRM,
+        if last { P2_LAST } else { P2_MORE },
+        data.len() as u8,
+    ];
+    apdu.extend_from_slice(data);
+    apdu
+}
+
+/// APDUs for Ledger `signOffchainMessage` (INS 0x07).
+///
+/// Chunking matches `@ledgerhq/hw-app-solana`: 255-byte slices of
+/// `[path count][derivation][serialized message]`, `P2_MORE` until the last
+/// slice, and `P2_EXTEND` on every slice after the first.
+pub fn build_offchain_sign_apdus(path: &str, message: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if message.len() > crate::offchain::LEDGER_MAX_LEN {
+        return Err(Error::msg(
+            "This off-chain message is too long for a Ledger",
+        ));
+    }
+    let deriv = encode_derivation_path(path)?;
+    let mut payload = Vec::with_capacity(1 + deriv.len() + message.len());
+    payload.push(0x01);
+    payload.extend_from_slice(&deriv);
+    payload.extend_from_slice(message);
+    let mut out = Vec::new();
+    let mut offset = 0;
+    let mut p2 = P2_LAST;
+    if payload.len() > OFFCHAIN_CHUNK {
+        while payload.len() - offset > OFFCHAIN_CHUNK {
+            let end = offset + OFFCHAIN_CHUNK;
+            out.push(offchain_apdu(&payload[offset..end], p2 | P2_MORE));
+            offset = end;
+            p2 |= P2_EXTEND;
+        }
+    }
+    out.push(offchain_apdu(&payload[offset..], p2));
+    Ok(out)
+}
+
+fn offchain_apdu(data: &[u8], p2: u8) -> Vec<u8> {
+    let mut apdu = vec![CLA, INS_SIGN_OFFCHAIN, P1_CONFIRM, p2, data.len() as u8];
     apdu.extend_from_slice(data);
     apdu
 }
@@ -153,6 +211,7 @@ pub fn split_status(mut resp: Vec<u8>) -> Result<Vec<u8>> {
 
 pub fn status_message(sw: u16) -> String {
     match sw {
+        0x6808 => "The Ledger could not show this message. Update the Solana app (1.14 or newer) or turn on blind signing for non-ASCII text.".into(),
         0x6985 => "Rejected on the Ledger".into(),
         0x6A82 => "Open the Solana app on the Ledger".into(),
         0x6E00 => "Ledger CLA not supported — open the Solana app".into(),
@@ -240,10 +299,23 @@ pub fn get_address(device_path: &str, derivation: &str, display: bool) -> Result
     Ok(tx::encode_pubkey(&pk))
 }
 
+pub fn sign_offchain_message(
+    device_path: &str,
+    derivation: &str,
+    message: &[u8],
+) -> Result<[u8; 64]> {
+    let apdus = build_offchain_sign_apdus(derivation, message)?;
+    exchange_sign(device_path, &apdus)
+}
+
 pub fn sign_message(device_path: &str, derivation: &str, message: &[u8]) -> Result<[u8; 64]> {
     let apdus = build_sign_apdus(derivation, message)?;
+    exchange_sign(device_path, &apdus)
+}
+
+fn exchange_sign(device_path: &str, apdus: &[Vec<u8>]) -> Result<[u8; 64]> {
     let mut last = Vec::new();
-    let timeout = Duration::from_secs(60);
+    let timeout = Duration::from_secs(90);
     for (i, apdu) in apdus.iter().enumerate() {
         let wait = if i + 1 == apdus.len() {
             timeout
@@ -338,7 +410,9 @@ fn exchange(device_path: &str, apdu: &[u8], timeout: Duration) -> Result<Vec<u8>
     let mut expected_len: Option<usize> = None;
     loop {
         if Instant::now() > deadline {
-            return Err(Error::msg("Ledger timed out — confirm on the device, Solana app open"));
+            return Err(Error::msg(
+                "Ledger timed out — confirm on the device, Solana app open",
+            ));
         }
         let mut buf = [0u8; PACKET];
         match file.read(&mut buf) {
@@ -410,8 +484,49 @@ mod tests {
     }
 
     #[test]
+    fn offchain_apdu_is_ins_07_and_chunks_like_ledger_js() {
+        let msg = b"Hello world";
+        let apdus = build_offchain_sign_apdus("m/44'/501'/0'", msg).unwrap();
+        assert_eq!(apdus.len(), 1);
+        assert_eq!(apdus[0][1], INS_SIGN_OFFCHAIN);
+        assert_eq!(apdus[0][2], P1_CONFIRM);
+        assert_eq!(apdus[0][3], P2_LAST);
+        let data = &apdus[0][5..];
+        assert_eq!(data[0], 1);
+        assert_eq!(data[1], 3);
+        assert!(data.ends_with(msg));
+
+        let long = vec![0x41u8; 600];
+        let apdus = build_offchain_sign_apdus("m/44'/501'/0'", &long).unwrap();
+        assert!(apdus.len() >= 3);
+        assert_eq!(apdus[0][3], P2_MORE);
+        assert_eq!(apdus[1][3], P2_MORE | P2_EXTEND);
+        assert_eq!(apdus.last().unwrap()[3], P2_EXTEND);
+        let mut joined = Vec::new();
+        for apdu in &apdus {
+            joined.extend_from_slice(&apdu[5..]);
+        }
+        assert_eq!(joined[0], 1);
+        assert_eq!(&joined[joined.len() - long.len()..], &long[..]);
+        assert!(build_offchain_sign_apdus(
+            "m/44'/501'/0'",
+            &[0u8; crate::offchain::LEDGER_MAX_LEN + 1]
+        )
+        .is_err());
+    }
+
+    #[test]
     fn no_trezor_vendor() {
         assert_ne!(LEDGER_VID, 0x1209);
         assert_ne!(LEDGER_VID, 0x534c);
+    }
+
+    #[test]
+    fn v1_transaction_is_refused_before_any_apdu() {
+        let err = build_sign_apdus("m/44'/501'/0'", &[0x81, 1, 0, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version 1"), "{err}");
+        assert!(build_sign_apdus("m/44'/501'/0'", &[0x80, 1, 0, 0]).is_ok());
     }
 }

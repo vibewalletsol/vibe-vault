@@ -727,14 +727,14 @@ pub fn notify_tx(ctx: &Ctx, kind: &str, signature: &str, pay: &str, recv: &str) 
     };
     if let Some(app) = ctx.window.application() {
         let n = gio::Notification::new(title);
-        n.set_body(Some(&format!("{line}\nTap to open Solscan")));
+        n.set_body(Some(&format!("{line}\nTap to open Vibe Explorer")));
         n.set_priority(gio::NotificationPriority::High);
         n.set_default_action_and_target_value("app.open-solscan", Some(&signature.to_variant()));
         let id = format!("vibe-{kind}-{signature}");
         app.send_notification(Some(&id), &n);
     }
     let toast = adw::Toast::new(&format!("{line}  confirmed"));
-    toast.set_button_label(Some("Solscan"));
+    toast.set_button_label(Some("Vibe Explorer"));
     toast.set_timeout(0);
     let url_t = url.clone();
     toast.connect_button_clicked(move |_| {

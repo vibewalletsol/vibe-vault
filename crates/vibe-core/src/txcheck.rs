@@ -1,4 +1,4 @@
-//! Vault-side transaction review: strict legacy/v0 message parsing, Address
+//! Vault-side transaction review: strict legacy/v0/v1 message parsing, Address
 //! Lookup Table (ALT) resolution and the static drainer rules (vault-spec.md §3.2, §4).
 //!
 //! Everything here runs inside vibe-vault on the exact bytes that will be signed.
@@ -20,8 +20,12 @@ use crate::tx::{self, AccountMeta, Instruction};
 
 /// Size of the ALT metadata header (`LOOKUP_TABLE_META_SIZE`).
 pub const ALT_META_SIZE: usize = 56;
-/// Solana packet limit (bytes) for a serialized transaction.
+/// Solana packet limit (bytes) for a serialized legacy or v0 transaction.
 pub const PACKET_DATA_SIZE: usize = 1232;
+/// SIMD-0385 limit for a version 1 transaction, message plus signatures.
+pub const V1_MAX_TRANSACTION_SIZE: usize = 4096;
+/// First byte of a version 1 message and of a version 1 wire transaction.
+pub const V1_PREFIX: u8 = 0x81;
 /// R14 default: warn when the priority fee is above 0.01 SOL.
 pub const PRIORITY_FEE_WARN_LAMPORTS: u64 = 10_000_000;
 
@@ -48,9 +52,22 @@ pub struct LookupRef {
     pub readonly: Vec<u8>,
 }
 
+/// Resource requests carried in a version 1 header (SIMD-0385).
+///
+/// The priority fee is a total in lamports. Compute Budget instructions in the
+/// same transaction do not change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V1Budget {
+    pub priority_fee_lamports: u64,
+    /// `None` when bit 2 is unset. The network then treats the limit as 0.
+    pub compute_unit_limit: Option<u32>,
+    /// `None` when bit 3 is unset. Unset and zero both fail account loading.
+    pub loaded_accounts_data_size: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedMessage {
-    /// `None` = legacy, `Some(0)` = v0.
+    /// `None` = legacy, `Some(0)` = v0, `Some(1)` = v1.
     pub version: Option<u8>,
     pub num_required_signatures: u8,
     pub num_readonly_signed: u8,
@@ -59,6 +76,8 @@ pub struct ParsedMessage {
     pub recent_blockhash: String,
     pub instructions: Vec<CompiledIx>,
     pub lookups: Vec<LookupRef>,
+    /// Set only for version 1. Legacy and v0 leave this empty.
+    pub v1: Option<V1Budget>,
 }
 
 impl ParsedMessage {
@@ -92,11 +111,14 @@ fn key_at(b: &[u8], off: &mut usize, what: &str) -> Result<String, String> {
     Ok(tx::encode_pubkey(&k))
 }
 
-/// Strict parse of a legacy or v0 message. Rejects unknown versions, trailing
+/// Strict parse of a legacy, v0, or v1 message. Rejects unknown versions, trailing
 /// bytes, duplicate static keys, bad headers and program ids outside the static keys.
 pub fn parse_message(m: &[u8]) -> Result<ParsedMessage, String> {
     if m.is_empty() {
         return Err("empty message".into());
+    }
+    if m[0] == V1_PREFIX {
+        return parse_v1_message(m);
     }
     if m.len() > PACKET_DATA_SIZE {
         return Err("message larger than a Solana packet".into());
@@ -169,7 +191,10 @@ pub fn parse_message(m: &[u8]) -> Result<ParsedMessage, String> {
         }
     }
     if off != m.len() {
-        return Err(format!("{} trailing bytes after the message", m.len() - off));
+        return Err(format!(
+            "{} trailing bytes after the message",
+            m.len() - off
+        ));
     }
     let parsed = ParsedMessage {
         version,
@@ -180,6 +205,7 @@ pub fn parse_message(m: &[u8]) -> Result<ParsedMessage, String> {
         recent_blockhash,
         instructions,
         lookups,
+        v1: None,
     };
     let total = n_keys + parsed.loaded_count();
     if total > 256 {
@@ -193,8 +219,163 @@ pub fn parse_message(m: &[u8]) -> Result<ParsedMessage, String> {
     Ok(parsed)
 }
 
+/// Version 1 message (SIMD-0385). Signatures are not part of this slice.
+///
+/// Layout: `0x81`, 3-byte header, config mask `u32` LE, 32-byte blockhash,
+/// instruction count `u8`, address count `u8`, addresses, config values in bit
+/// order, every instruction header, then every instruction payload.
+fn parse_v1_message(m: &[u8]) -> Result<ParsedMessage, String> {
+    const MAX_SIGNATURES: u8 = 12;
+    const MAX_ADDRESSES: u8 = 64;
+    const MAX_INSTRUCTIONS: u8 = 64;
+    const KNOWN_MASK: u32 = 0b1_1111;
+    const MIN_HEAP: u32 = 32 * 1024;
+    const MAX_HEAP: u32 = 256 * 1024;
+    // version + header + mask + blockhash + two counts
+    if m.len() < 42 {
+        return Err("version 1 message truncated".into());
+    }
+    let (n_req, n_ro_s, n_ro_u) = (m[1], m[2], m[3]);
+    if n_req == 0 || n_req > MAX_SIGNATURES {
+        return Err("version 1 signature count is invalid".into());
+    }
+    let sig_bytes = n_req as usize * 64;
+    if m.len().saturating_add(sig_bytes) > V1_MAX_TRANSACTION_SIZE {
+        return Err("version 1 transaction is larger than 4096 bytes".into());
+    }
+    let mask = u32::from_le_bytes(m[4..8].try_into().unwrap());
+    if mask & !KNOWN_MASK != 0 {
+        return Err("version 1 config has an unknown field".into());
+    }
+    let fee_bits = mask & 0b11;
+    if fee_bits != 0 && fee_bits != 0b11 {
+        return Err("version 1 priority fee must set both header bits".into());
+    }
+    let mut off = 8usize;
+    let recent_blockhash = key_at(m, &mut off, "blockhash")?;
+    let n_ix = take(m, &mut off, 1, "instruction count")?[0];
+    let n_addr = take(m, &mut off, 1, "address count")?[0];
+    if n_ix > MAX_INSTRUCTIONS {
+        return Err("version 1 has more than 64 instructions".into());
+    }
+    if n_addr == 0 || n_addr > MAX_ADDRESSES {
+        return Err("version 1 address count is invalid".into());
+    }
+    let n_keys = n_addr as usize;
+    if n_req as usize > n_keys {
+        return Err("bad header: signer count".into());
+    }
+    if n_ro_s >= n_req || n_ro_u as usize > n_keys - n_req as usize {
+        return Err("bad header: readonly counts".into());
+    }
+    let mut static_keys = Vec::with_capacity(n_keys);
+    let mut seen = HashSet::new();
+    for _ in 0..n_keys {
+        let k = key_at(m, &mut off, "account keys")?;
+        if !seen.insert(k.clone()) {
+            return Err(format!("duplicate account key {k}"));
+        }
+        static_keys.push(k);
+    }
+    let mut priority_fee_lamports = 0u64;
+    let mut compute_unit_limit = None;
+    let mut loaded_accounts_data_size = None;
+    if fee_bits == 0b11 {
+        let raw = take(m, &mut off, 8, "priority fee")?;
+        priority_fee_lamports = u64::from_le_bytes(raw.try_into().unwrap());
+    }
+    if mask & 0b100 != 0 {
+        let raw = take(m, &mut off, 4, "compute limit")?;
+        compute_unit_limit = Some(u32::from_le_bytes(raw.try_into().unwrap()));
+    }
+    if mask & 0b1000 != 0 {
+        let raw = take(m, &mut off, 4, "account data limit")?;
+        loaded_accounts_data_size = Some(u32::from_le_bytes(raw.try_into().unwrap()));
+    }
+    if mask & 0b1_0000 != 0 {
+        let raw = take(m, &mut off, 4, "heap size")?;
+        let heap = u32::from_le_bytes(raw.try_into().unwrap());
+        if heap % 1024 != 0 || !(MIN_HEAP..=MAX_HEAP).contains(&heap) {
+            return Err(
+                "version 1 heap size must be a multiple of 1 KiB between 32 KiB and 256 KiB".into(),
+            );
+        }
+    }
+    struct IxHead {
+        program: u8,
+        n_acc: u8,
+        n_data: u16,
+    }
+    let mut heads = Vec::with_capacity(n_ix as usize);
+    for _ in 0..n_ix {
+        let raw = take(m, &mut off, 4, "instruction header")?;
+        heads.push(IxHead {
+            program: raw[0],
+            n_acc: raw[1],
+            n_data: u16::from_le_bytes([raw[2], raw[3]]),
+        });
+    }
+    let mut instructions = Vec::with_capacity(heads.len());
+    for head in &heads {
+        if head.program as usize >= n_keys {
+            return Err("instruction program id is not a static account key".into());
+        }
+        if head.program == 0 {
+            return Err("version 1 instruction cannot use the fee payer as the program".into());
+        }
+        let accounts = take(m, &mut off, head.n_acc as usize, "instruction accounts")?.to_vec();
+        let data = take(m, &mut off, head.n_data as usize, "instruction data")?.to_vec();
+        if let Some(&bad) = accounts.iter().find(|&&i| i as usize >= n_keys) {
+            return Err(format!("instruction account index {bad} out of range"));
+        }
+        instructions.push(CompiledIx {
+            program_index: head.program,
+            accounts,
+            data,
+        });
+    }
+    if off != m.len() {
+        return Err(format!(
+            "{} trailing bytes after the message",
+            m.len() - off
+        ));
+    }
+    Ok(ParsedMessage {
+        version: Some(1),
+        num_required_signatures: n_req,
+        num_readonly_signed: n_ro_s,
+        num_readonly_unsigned: n_ro_u,
+        static_keys,
+        recent_blockhash,
+        instructions,
+        lookups: Vec::new(),
+        v1: Some(V1Budget {
+            priority_fee_lamports,
+            compute_unit_limit,
+            loaded_accounts_data_size,
+        }),
+    })
+}
+
 /// Split a wire transaction into (signature count, message bytes).
+///
+/// Legacy and v0 keep signatures at the front and the 1,232-byte packet limit.
+/// Version 1 (`0x81`) keeps signatures at the tail and allows 4,096 bytes.
 pub fn split_wire(txb: &[u8]) -> Result<(usize, &[u8]), String> {
+    if txb.first() == Some(&V1_PREFIX) {
+        if txb.len() > V1_MAX_TRANSACTION_SIZE {
+            return Err("version 1 transaction is larger than 4096 bytes".into());
+        }
+        let n = *txb.get(1).ok_or("transaction truncated")? as usize;
+        if n == 0 || n > 12 {
+            return Err("version 1 signature count is invalid".into());
+        }
+        let sigs = n * 64;
+        if sigs >= txb.len() {
+            return Err("transaction truncated".into());
+        }
+        return Ok((n, &txb[..txb.len() - sigs]));
+    }
     if txb.len() > PACKET_DATA_SIZE {
         return Err("transaction larger than a Solana packet".into());
     }
@@ -230,7 +411,9 @@ impl AltTable {
 pub fn parse_alt_account(key: &str, owner: &str, data: &[u8]) -> Result<AltTable, String> {
     let short = crate::format::shorten_address(key);
     if owner != ProgramIds::ADDRESS_LOOKUP_TABLE {
-        return Err(format!("lookup table {short} is not owned by the lookup-table program"));
+        return Err(format!(
+            "lookup table {short} is not owned by the lookup-table program"
+        ));
     }
     if data.len() < ALT_META_SIZE {
         return Err(format!("lookup table {short} is too short"));
@@ -462,10 +645,12 @@ pub fn known_program(id: &str) -> bool {
 }
 
 fn u32_at(d: &[u8], at: usize) -> Option<u32> {
-    d.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    d.get(at..at + 4)
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
 }
 fn u64_at(d: &[u8], at: usize) -> Option<u64> {
-    d.get(at..at + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+    d.get(at..at + 8)
+        .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
 }
 fn key_in(d: &[u8], at: usize) -> Option<String> {
     d.get(at..at + 32).map(|s| {
@@ -487,7 +672,10 @@ pub fn lookalike_of<'a>(addr: &str, contacts: &'a [String]) -> Option<&'a str> {
         return None;
     }
     contacts.iter().map(|c| c.as_str()).find(|c| {
-        c.len() >= 8 && *c != addr && c[..4] == addr[..4] && c[c.len() - 4..] == addr[addr.len() - 4..]
+        c.len() >= 8
+            && *c != addr
+            && c[..4] == addr[..4]
+            && c[c.len() - 4..] == addr[addr.len() - 4..]
     })
 }
 
@@ -499,19 +687,31 @@ where
 {
     let user = ctx.user;
     let mut out = Vec::new();
-    if !msg
-        .accounts
-        .iter()
-        .any(|a| a.signer && a.pubkey == user)
-    {
-        out.push(f("SIGNER", Level::Block, "This wallet is not a required signer on this transaction."));
+    if !msg.accounts.iter().any(|a| a.signer && a.pubkey == user) {
+        out.push(f(
+            "SIGNER",
+            Level::Block,
+            "This wallet is not a required signer on this transaction.",
+        ));
     }
     if msg.fee_payer() != user {
-        out.push(f("FEE", Level::Info, format!("Fee payer is {}, not this wallet.", short(msg.fee_payer()))));
+        out.push(f(
+            "FEE",
+            Level::Info,
+            format!("Fee payer is {}, not this wallet.", short(msg.fee_payer())),
+        ));
     }
-    let others = msg.accounts.iter().filter(|a| a.signer && a.pubkey != user).count();
+    let others = msg
+        .accounts
+        .iter()
+        .filter(|a| a.signer && a.pubkey != user)
+        .count();
     if others > 0 {
-        out.push(f("SIGNERS", Level::Info, format!("Other signers: {others}.")));
+        out.push(f(
+            "SIGNERS",
+            Level::Info,
+            format!("Other signers: {others}."),
+        ));
     }
     let mut sol_out: u128 = 0;
     let mut cu_limit: Option<u32> = None;
@@ -560,14 +760,27 @@ where
                     // SetAuthority: [account, current authority]; data: type u8, COption<Pubkey>
                     6 if acct(ix, 1) == user => {
                         let kind = d.get(1).copied().unwrap_or(255);
-                        let new = if d.get(2) == Some(&1) { key_in(d, 3) } else { None };
+                        let new = if d.get(2) == Some(&1) {
+                            key_in(d, 3)
+                        } else {
+                            None
+                        };
                         // 2 = AccountOwner, 3 = CloseAccount
                         if (kind == 2 || kind == 3) && new.as_deref() != Some(user) {
-                            out.push(f("R1", Level::Block, format!(
-                                "Hands {} of token account {} to {}.",
-                                if kind == 2 { "ownership" } else { "close authority" },
-                                short(acct(ix, 0)),
-                                new.unwrap_or_else(|| "nobody".into()))));
+                            out.push(f(
+                                "R1",
+                                Level::Block,
+                                format!(
+                                    "Hands {} of token account {} to {}.",
+                                    if kind == 2 {
+                                        "ownership"
+                                    } else {
+                                        "close authority"
+                                    },
+                                    short(acct(ix, 0)),
+                                    new.unwrap_or_else(|| "nobody".into())
+                                ),
+                            ));
                         }
                     }
                     4 | 13 => {
@@ -582,20 +795,46 @@ where
                                 Ok(Some((_, _, data))) => u64_at(&data, 64),
                                 _ => None,
                             };
-                            let unlimited = amount == u64::MAX || balance.map(|b| amount >= b && b > 0).unwrap_or(false);
+                            let unlimited = amount == u64::MAX
+                                || balance.map(|b| amount >= b && b > 0).unwrap_or(false);
                             if unlimited && ctx.block_infinite_approve {
-                                out.push(f("R2a", Level::Block, format!(
-                                    "Approves {} to spend all tokens in {} (amount {}).",
-                                    delegate, short(src),
-                                    if amount == u64::MAX { "unlimited".to_string() } else { amount.to_string() })));
+                                out.push(f(
+                                    "R2a",
+                                    Level::Block,
+                                    format!(
+                                        "Approves {} to spend all tokens in {} (amount {}).",
+                                        delegate,
+                                        short(src),
+                                        if amount == u64::MAX {
+                                            "unlimited".to_string()
+                                        } else {
+                                            amount.to_string()
+                                        }
+                                    ),
+                                ));
                             } else if delegate != user {
-                                out.push(f("R2b", Level::Warn, format!(
-                                    "Approves {} to spend up to {} raw units from {}.", delegate, amount, short(src))));
+                                out.push(f(
+                                    "R2b",
+                                    Level::Warn,
+                                    format!(
+                                        "Approves {} to spend up to {} raw units from {}.",
+                                        delegate,
+                                        amount,
+                                        short(src)
+                                    ),
+                                ));
                             }
                         }
                     }
-                    9 if acct(ix, 2) == user && acct(ix, 1) != user => out.push(f("R3", Level::Block,
-                        format!("Closes token account {} and sends its SOL to {}.", short(acct(ix, 0)), acct(ix, 1)))),
+                    9 if acct(ix, 2) == user && acct(ix, 1) != user => out.push(f(
+                        "R3",
+                        Level::Block,
+                        format!(
+                            "Closes token account {} and sends its SOL to {}.",
+                            short(acct(ix, 0)),
+                            acct(ix, 1)
+                        ),
+                    )),
                     3 | 12 => {
                         let dest = if op == 3 { acct(ix, 1) } else { acct(ix, 2) };
                         if let Some(c) = lookalike_of(dest, ctx.contacts) {
@@ -642,10 +881,19 @@ where
                 // SetAuthority (4): [account, current, new?]; SetAuthorityChecked (7): [account, current, new]
                 if (op == 4 || op == 7) && acct(ix, 1) == user && acct(ix, 2) != user {
                     let new = acct(ix, 2);
-                    out.push(f("R18", Level::Block, format!(
-                        "Hands the upgrade authority of {} to {}.",
-                        short(acct(ix, 0)),
-                        if new.is_empty() { "nobody (makes it immutable)" } else { new })));
+                    out.push(f(
+                        "R18",
+                        Level::Block,
+                        format!(
+                            "Hands the upgrade authority of {} to {}.",
+                            short(acct(ix, 0)),
+                            if new.is_empty() {
+                                "nobody (makes it immutable)"
+                            } else {
+                                new
+                            }
+                        ),
+                    ));
                 }
             }
             ProgramIds::COMPUTE_BUDGET => match d.first() {
@@ -672,34 +920,92 @@ where
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        out.push(f("R6", Level::Warn, format!(
-            "Unknown program {p}: VIBE can't tell what this does. Writable accounts: {}.",
-            if touches.is_empty() { "none".into() } else { touches.join(", ") })));
+        out.push(f(
+            "R6",
+            Level::Warn,
+            format!(
+                "Unknown program {p}: VIBE can't tell what this does. Writable accounts: {}.",
+                if touches.is_empty() {
+                    "none".into()
+                } else {
+                    touches.join(", ")
+                }
+            ),
+        ));
     }
     // R7 (SOL part): outflow from the wallet above max_sol_per_tx.
     let sol = sol_out as f64 / crate::LAMPORTS_PER_SOL as f64;
     if ctx.max_sol_per_tx > 0.0 && sol > ctx.max_sol_per_tx + 1e-9 {
-        out.push(f("R7", Level::Block, format!(
-            "Vault rule: max {} SOL per tx (this sends {sol:.4} SOL).", ctx.max_sol_per_tx)));
+        out.push(f(
+            "R7",
+            Level::Block,
+            format!(
+                "Vault rule: max {} SOL per tx (this sends {sol:.4} SOL).",
+                ctx.max_sol_per_tx
+            ),
+        ));
     }
-    // R14: priority fee = limit × price / 1e6.
-    // Same math as `fees::priority_fee_lamports` (runtime clamps the limit to 1.4M, rounds up).
-    let limit = cu_limit.unwrap_or_else(|| non_budget.saturating_mul(crate::fees::DEFAULT_UNITS_PER_IX));
-    let prio = crate::fees::priority_fee_lamports(limit, cu_price);
+    // R14. Legacy and v0: limit × price / 1e6 (runtime clamps the limit to 1.4M).
+    // Version 1: the header value is already the total in lamports. Compute Budget
+    // instructions in that transaction do not set the fee.
+    let v1_fee = msg.parsed.v1.map(|b| b.priority_fee_lamports);
+    let (prio, cu_price_note) = if let Some(total) = v1_fee {
+        (total, None)
+    } else {
+        let limit = cu_limit
+            .unwrap_or_else(|| non_budget.saturating_mul(crate::fees::DEFAULT_UNITS_PER_IX));
+        (
+            crate::fees::priority_fee_lamports(limit, cu_price),
+            Some(cu_price),
+        )
+    };
     let max_fee = if ctx.priority_fee_max_lamports == 0 {
         crate::fees::MAX_PRIORITY_FEE_LAMPORTS
     } else {
-        ctx.priority_fee_max_lamports.min(crate::fees::MAX_PRIORITY_FEE_LAMPORTS)
+        ctx.priority_fee_max_lamports
+            .min(crate::fees::MAX_PRIORITY_FEE_LAMPORTS)
     };
     if prio > max_fee {
-        out.push(f("R14b", Level::Block, format!(
-            "Priority fee is {:.4} SOL ({} µ-lamports/CU). The vault maximum is {:.4} SOL.",
-            prio as f64 / crate::LAMPORTS_PER_SOL as f64,
-            cu_price,
-            max_fee as f64 / crate::LAMPORTS_PER_SOL as f64)));
+        let text = if let Some(price) = cu_price_note {
+            format!(
+                "Priority fee is {:.4} SOL ({} µ-lamports/CU). The vault maximum is {:.4} SOL.",
+                prio as f64 / crate::LAMPORTS_PER_SOL as f64,
+                price,
+                max_fee as f64 / crate::LAMPORTS_PER_SOL as f64
+            )
+        } else {
+            format!(
+                "Priority fee is {:.4} SOL. The vault maximum is {:.4} SOL.",
+                prio as f64 / crate::LAMPORTS_PER_SOL as f64,
+                max_fee as f64 / crate::LAMPORTS_PER_SOL as f64
+            )
+        };
+        out.push(f("R14b", Level::Block, text));
     } else if prio > ctx.priority_fee_warn_lamports {
-        out.push(f("R14", Level::Warn, format!(
-            "Priority fee is {:.4} SOL.", prio as f64 / crate::LAMPORTS_PER_SOL as f64)));
+        out.push(f(
+            "R14",
+            Level::Warn,
+            format!(
+                "Priority fee is {:.4} SOL.",
+                prio as f64 / crate::LAMPORTS_PER_SOL as f64
+            ),
+        ));
+    }
+    if let Some(budget) = msg.parsed.v1 {
+        if budget.compute_unit_limit.unwrap_or(0) == 0 {
+            out.push(f(
+                "V1",
+                Level::Warn,
+                "This version 1 transaction sets no compute limit, so the network will reject it.",
+            ));
+        }
+        if budget.loaded_accounts_data_size.unwrap_or(0) == 0 {
+            out.push(f(
+                "V1",
+                Level::Warn,
+                "This version 1 transaction sets no account-data limit, so the network will reject it.",
+            ));
+        }
     }
     if ctx.from_dapp {
         out.push(f("PENDING", Level::Info,
@@ -759,7 +1065,11 @@ where
     let parsed = match parse_message(message) {
         Ok(p) => p,
         Err(e) => {
-            r.findings.push(f("R15", Level::Block, format!("VIBE can't read this transaction: {e}.")));
+            r.findings.push(f(
+                "R15",
+                Level::Block,
+                format!("VIBE can't read this transaction: {e}."),
+            ));
             return r;
         }
     };
@@ -770,8 +1080,11 @@ where
     let resolved = match resolve(&parsed, &mut fetch) {
         Ok(m) => m,
         Err(e) => {
-            r.findings.push(f("R15", Level::Block, format!(
-                "VIBE can't show what this transaction touches: {e}. Signing is blocked.")));
+            r.findings.push(f(
+                "R15",
+                Level::Block,
+                format!("VIBE can't show what this transaction touches: {e}. Signing is blocked."),
+            ));
             // Still list what is known, with the unresolved entries marked.
             for (i, k) in parsed.static_keys.iter().enumerate() {
                 r.account_lines.push(format!("#{i} {k} [static]"));
@@ -779,7 +1092,10 @@ where
             for lu in &parsed.lookups {
                 r.account_lines.push(format!(
                     "{} writable + {} readonly account(s) from lookup table {} — UNRESOLVED",
-                    lu.writable.len(), lu.readonly.len(), lu.table));
+                    lu.writable.len(),
+                    lu.readonly.len(),
+                    lu.table
+                ));
             }
             return r;
         }
@@ -810,7 +1126,11 @@ where
     match split_wire(txb) {
         Ok((_, m)) => review_message(m, ctx, fetch),
         Err(e) => Review {
-            findings: vec![f("R15", Level::Block, format!("VIBE can't read this transaction: {e}."))],
+            findings: vec![f(
+                "R15",
+                Level::Block,
+                format!("VIBE can't read this transaction: {e}."),
+            )],
             ..Default::default()
         },
     }
@@ -821,12 +1141,21 @@ pub fn review_batch<F>(txs: &[Vec<u8>], ctx: &RuleCtx, mut fetch: F) -> Vec<Revi
 where
     F: FnMut(&str) -> Fetched,
 {
-    let mut out: Vec<Review> = txs.iter().map(|t| review_wire(t, ctx, &mut fetch)).collect();
+    let mut out: Vec<Review> = txs
+        .iter()
+        .map(|t| review_wire(t, ctx, &mut fetch))
+        .collect();
     if let Some(bad) = out.iter().position(|r| r.blocked()) {
         for (i, r) in out.iter_mut().enumerate() {
             if i != bad && !r.blocked() {
-                r.findings.push(f("R10", Level::Block, format!(
-                    "Transaction {} in this batch is blocked, so the whole batch is blocked.", bad + 1)));
+                r.findings.push(f(
+                    "R10",
+                    Level::Block,
+                    format!(
+                        "Transaction {} in this batch is blocked, so the whole batch is blocked.",
+                        bad + 1
+                    ),
+                ));
             }
         }
     }
@@ -836,7 +1165,83 @@ where
 /// R11: a `signMessage` payload that parses as a transaction (message or wire) is blocked.
 pub fn message_payload_is_transaction(bytes: &[u8]) -> bool {
     parse_message(bytes).is_ok()
-        || split_wire(bytes).map(|(_, m)| parse_message(m).is_ok()).unwrap_or(false)
+        || split_wire(bytes)
+            .map(|(_, m)| parse_message(m).is_ok())
+            .unwrap_or(false)
+}
+
+/// Test-only version 1 message. `mask` is the config bitmask; `config` is the
+/// raw value bytes that follow the addresses. Instructions are (program index,
+/// account indexes, data).
+#[cfg(test)]
+pub(crate) fn v1_message_raw(
+    header: [u8; 3],
+    mask: u32,
+    addresses: &[[u8; 32]],
+    config: &[u8],
+    ixs: &[(u8, &[u8], &[u8])],
+    trailing: usize,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(V1_PREFIX);
+    m.extend_from_slice(&header);
+    m.extend_from_slice(&mask.to_le_bytes());
+    m.extend_from_slice(&[4u8; 32]);
+    m.push(ixs.len() as u8);
+    m.push(addresses.len() as u8);
+    for a in addresses {
+        m.extend_from_slice(a);
+    }
+    m.extend_from_slice(config);
+    for (program, accounts, data) in ixs {
+        m.push(*program);
+        m.push(accounts.len() as u8);
+        m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    }
+    for (_, accounts, data) in ixs {
+        m.extend_from_slice(accounts);
+        m.extend_from_slice(data);
+    }
+    m.extend(std::iter::repeat(0u8).take(trailing));
+    m
+}
+
+/// One-signer system transfer. `pad` extra bytes ride on the transfer data.
+#[cfg(test)]
+pub(crate) fn v1_transfer_message(
+    payer: &[u8; 32],
+    to: &[u8; 32],
+    lamports: u64,
+    fee: Option<u64>,
+    pad: usize,
+) -> Vec<u8> {
+    let system = tx::decode_pubkey(ProgramIds::SYSTEM).unwrap();
+    let mut data = Vec::with_capacity(12 + pad);
+    data.extend_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&lamports.to_le_bytes());
+    data.extend(std::iter::repeat(0u8).take(pad));
+    let mut mask = 0u32;
+    let mut config = Vec::new();
+    if let Some(fee) = fee {
+        mask |= 0b11;
+        config.extend_from_slice(&fee.to_le_bytes());
+    }
+    v1_message_raw(
+        [1, 0, 1],
+        mask,
+        &[*payer, *to, system],
+        &config,
+        &[(2, &[0, 1], data.as_slice())],
+        0,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn v1_with_sigs(message: &[u8]) -> Vec<u8> {
+    let n = message.get(1).copied().unwrap_or(0) as usize;
+    let mut w = message.to_vec();
+    w.extend(std::iter::repeat(0u8).take(n * 64));
+    w
 }
 
 #[cfg(test)]
@@ -857,7 +1262,13 @@ mod tests {
     type Ix = (u8, Vec<u8>, Vec<u8>);
     type Lu = ([u8; 32], Vec<u8>, Vec<u8>);
 
-    fn msg(version: Option<u8>, hdr: [u8; 3], keys: &[[u8; 32]], ixs: &[Ix], lus: &[Lu]) -> Vec<u8> {
+    fn msg(
+        version: Option<u8>,
+        hdr: [u8; 3],
+        keys: &[[u8; 32]],
+        ixs: &[Ix],
+        lus: &[Lu],
+    ) -> Vec<u8> {
         let mut m = Vec::new();
         if let Some(v) = version {
             m.push(0x80 | v);
@@ -918,7 +1329,11 @@ mod tests {
         let key = b58(&table);
         move |k: &str| {
             if k == key {
-                Ok(Some((ProgramIds::ADDRESS_LOOKUP_TABLE.to_string(), 1, data.clone())))
+                Ok(Some((
+                    ProgramIds::ADDRESS_LOOKUP_TABLE.to_string(),
+                    1,
+                    data.clone(),
+                )))
             } else {
                 Ok(None)
             }
@@ -950,7 +1365,13 @@ mod tests {
             &[(1, vec![2, 0], data)],
             &[(table, vec![1], vec![])],
         );
-        (m, table, alt_data(&[filler, victim_ata], u64::MAX), b58(&user), b58(&victim_ata))
+        (
+            m,
+            table,
+            alt_data(&[filler, victim_ata], u64::MAX),
+            b58(&user),
+            b58(&victim_ata),
+        )
     }
 
     #[test]
@@ -963,7 +1384,10 @@ mod tests {
         assert!(res.accounts[2].writable);
         assert_eq!(
             res.accounts[2].source,
-            AccountSource::Lookup { table: b58(&table), index: 1 }
+            AccountSource::Lookup {
+                table: b58(&table),
+                index: 1
+            }
         );
         assert_eq!(res.instructions[0].accounts[0].pubkey, victim);
         assert_eq!(res.instructions[0].accounts[1].pubkey, user);
@@ -975,7 +1399,9 @@ mod tests {
         let r = review_message(&m, &ctx(&user, &[]), table_fetch(table, data));
         assert!(r.blocked(), "{:?}", r.findings);
         assert!(rules(&r).contains(&"R1"));
-        assert!(r.account_lines.iter().any(|l| l.contains(&victim) && l.contains("via lookup table") && l.contains("writable")));
+        assert!(r.account_lines.iter().any(|l| l.contains(&victim)
+            && l.contains("via lookup table")
+            && l.contains("writable")));
     }
 
     #[test]
@@ -984,7 +1410,11 @@ mod tests {
         let r = review_message(&m, &ctx(&user, &[]), |_| Err("connection refused".into()));
         assert!(r.blocked());
         assert_eq!(r.first_block().unwrap().rule, "R15");
-        assert!(r.first_block().unwrap().text.contains("could not be fetched"));
+        assert!(r
+            .first_block()
+            .unwrap()
+            .text
+            .contains("could not be fetched"));
         assert!(r.account_lines.iter().any(|l| l.contains("UNRESOLVED")));
     }
 
@@ -1038,17 +1468,34 @@ mod tests {
     fn strict_parse_rejects_bad_messages() {
         let (m, _t, _d, _u, _v) = drainer_v0();
         let mut bad = m.clone();
-        bad[0] = 0x81;
-        assert!(parse_message(&bad).unwrap_err().contains("unknown transaction version"));
+        bad[0] = 0x82;
+        assert!(parse_message(&bad)
+            .unwrap_err()
+            .contains("unknown transaction version"));
+        let mut v1ish = m.clone();
+        v1ish[0] = 0x81;
+        assert!(parse_message(&v1ish).is_err());
         let mut trailing = m.clone();
         trailing.push(0);
         assert!(parse_message(&trailing).unwrap_err().contains("trailing"));
         // Program id taken from a lookup table (index 2) is rejected.
         let user = rnd();
-        let p = msg(Some(0), [1, 0, 0], &[user], &[(2, vec![0], vec![])], &[(rnd(), vec![0], vec![])]);
+        let p = msg(
+            Some(0),
+            [1, 0, 0],
+            &[user],
+            &[(2, vec![0], vec![])],
+            &[(rnd(), vec![0], vec![])],
+        );
         assert!(parse_message(&p).is_err());
         // Account index past the resolved range.
-        let q = msg(Some(0), [1, 0, 0], &[user, pk(ProgramIds::SYSTEM)], &[(1, vec![9], vec![])], &[(rnd(), vec![0], vec![])]);
+        let q = msg(
+            Some(0),
+            [1, 0, 0],
+            &[user, pk(ProgramIds::SYSTEM)],
+            &[(1, vec![9], vec![])],
+            &[(rnd(), vec![0], vec![])],
+        );
         assert!(parse_message(&q).unwrap_err().contains("out of range"));
         let r = review_message(&bad, &ctx(&b58(&user), &[]), |_| Ok(None));
         assert_eq!(r.first_block().unwrap().rule, "R15");
@@ -1062,8 +1509,18 @@ mod tests {
         let thief = rnd();
         let table = rnd();
         // accounts: [ata(static writable), thief (loaded writable #3), user]
-        let m = msg(Some(0), [1, 0, 1], &[user, ata, token], &[(2, vec![1, 3, 0], vec![9])], &[(table, vec![0], vec![])]);
-        let r = review_message(&m, &ctx(&b58(&user), &[]), table_fetch(table, alt_data(&[thief], u64::MAX)));
+        let m = msg(
+            Some(0),
+            [1, 0, 1],
+            &[user, ata, token],
+            &[(2, vec![1, 3, 0], vec![9])],
+            &[(table, vec![0], vec![])],
+        );
+        let r = review_message(
+            &m,
+            &ctx(&b58(&user), &[]),
+            table_fetch(table, alt_data(&[thief], u64::MAX)),
+        );
         assert!(rules(&r).contains(&"R3"), "{:?}", r.findings);
     }
 
@@ -1074,7 +1531,13 @@ mod tests {
         let table = rnd();
         let mut d = 2u32.to_le_bytes().to_vec();
         d.extend_from_slice(&(5 * crate::LAMPORTS_PER_SOL).to_le_bytes());
-        let m = msg(Some(0), [1, 0, 1], &[user, pk(ProgramIds::SYSTEM)], &[(1, vec![0, 2], d)], &[(table, vec![0], vec![])]);
+        let m = msg(
+            Some(0),
+            [1, 0, 1],
+            &[user, pk(ProgramIds::SYSTEM)],
+            &[(1, vec![0, 2], d)],
+            &[(table, vec![0], vec![])],
+        );
         let u = b58(&user);
         let mut c = ctx(&u, &[]);
         c.max_sol_per_tx = 1.0;
@@ -1088,11 +1551,22 @@ mod tests {
         let user = rnd();
         let contact = b58(&rnd());
         // Forge an address with the same first/last 4 chars (string-level check).
-        let fake = format!("{}{}{}", &contact[..4], "1".repeat(contact.len() - 8), &contact[contact.len() - 4..]);
+        let fake = format!(
+            "{}{}{}",
+            &contact[..4],
+            "1".repeat(contact.len() - 8),
+            &contact[contact.len() - 4..]
+        );
         let contacts = vec![fake.clone()];
         let mut d = 2u32.to_le_bytes().to_vec();
         d.extend_from_slice(&1000u64.to_le_bytes());
-        let m = msg(None, [1, 0, 1], &[user, pk(&contact), pk(ProgramIds::SYSTEM)], &[(2, vec![0, 1], d)], &[]);
+        let m = msg(
+            None,
+            [1, 0, 1],
+            &[user, pk(&contact), pk(ProgramIds::SYSTEM)],
+            &[(2, vec![0, 1], d)],
+            &[],
+        );
         let r = review_message(&m, &ctx(&b58(&user), &contacts), |_| Ok(None));
         if fake != contact {
             assert!(rules(&r).contains(&"R16"), "{:?}", r.findings);
@@ -1112,15 +1586,29 @@ mod tests {
         // R2a unlimited approve: [src, delegate, owner]
         let mut ap = vec![4u8];
         ap.extend_from_slice(&u64::MAX.to_le_bytes());
-        let m = msg(None, [1, 0, 1], &[user, src, other, token], &[(3, vec![1, 2, 0], ap)], &[]);
+        let m = msg(
+            None,
+            [1, 0, 1],
+            &[user, src, other, token],
+            &[(3, vec![1, 2, 0], ap)],
+            &[],
+        );
         assert!(rules(&review_message(&m, &ctx(&u, &[]), |_| Ok(None))).contains(&"R2a"));
         // R2a: amount >= fetched balance
         let mut ap2 = vec![4u8];
         ap2.extend_from_slice(&500u64.to_le_bytes());
-        let m = msg(None, [1, 0, 1], &[user, src, other, token], &[(3, vec![1, 2, 0], ap2.clone())], &[]);
+        let m = msg(
+            None,
+            [1, 0, 1],
+            &[user, src, other, token],
+            &[(3, vec![1, 2, 0], ap2.clone())],
+            &[],
+        );
         let mut acct_data = vec![0u8; 165];
         acct_data[64..72].copy_from_slice(&400u64.to_le_bytes());
-        let r = review_message(&m, &ctx(&u, &[]), move |_| Ok(Some((ProgramIds::TOKEN.into(), 1, acct_data.clone()))));
+        let r = review_message(&m, &ctx(&u, &[]), move |_| {
+            Ok(Some((ProgramIds::TOKEN.into(), 1, acct_data.clone())))
+        });
         assert!(rules(&r).contains(&"R2a"));
         // R2b: limited approve to a foreign delegate
         let r = review_message(&m, &ctx(&u, &[]), |_| Ok(None));
@@ -1134,18 +1622,36 @@ mod tests {
         let nonce = rnd();
         let mut an = 7u32.to_le_bytes().to_vec();
         an.extend_from_slice(&other);
-        let m = msg(None, [1, 0, 1], &[user, nonce, system], &[(2, vec![1, 0], an)], &[]);
+        let m = msg(
+            None,
+            [1, 0, 1],
+            &[user, nonce, system],
+            &[(2, vec![1, 0], an)],
+            &[],
+        );
         assert!(rules(&review_message(&m, &ctx(&u, &[]), |_| Ok(None))).contains(&"R5"));
         // R5 stake Authorize: [stake, clock, authority]
         let sa = rnd();
         let mut au = 1u32.to_le_bytes().to_vec();
         au.extend_from_slice(&other);
         au.extend_from_slice(&0u32.to_le_bytes());
-        let m = msg(None, [1, 0, 2], &[user, sa, pk(ProgramIds::SYSVAR_CLOCK), stake], &[(3, vec![1, 2, 0], au)], &[]);
+        let m = msg(
+            None,
+            [1, 0, 2],
+            &[user, sa, pk(ProgramIds::SYSVAR_CLOCK), stake],
+            &[(3, vec![1, 2, 0], au)],
+            &[],
+        );
         assert!(rules(&review_message(&m, &ctx(&u, &[]), |_| Ok(None))).contains(&"R5"));
         // R18 BPF SetAuthority: [programdata, current, new]
         let pd = rnd();
-        let m = msg(None, [1, 0, 2], &[user, pd, other, bpf], &[(3, vec![1, 0, 2], 4u32.to_le_bytes().to_vec())], &[]);
+        let m = msg(
+            None,
+            [1, 0, 2],
+            &[user, pd, other, bpf],
+            &[(3, vec![1, 0, 2], 4u32.to_le_bytes().to_vec())],
+            &[],
+        );
         assert!(rules(&review_message(&m, &ctx(&u, &[]), |_| Ok(None))).contains(&"R18"));
         // R13 durable nonce first + R14 priority fee + R6 unknown program
         let unknown = rnd();
@@ -1159,12 +1665,20 @@ mod tests {
             None,
             [1, 0, 3],
             &[user, nonce, system, cb, unknown],
-            &[(2, vec![1, 0], 4u32.to_le_bytes().to_vec()), (3, vec![], lim), (3, vec![], price), (4, vec![1], vec![1, 2])],
+            &[
+                (2, vec![1, 0], 4u32.to_le_bytes().to_vec()),
+                (3, vec![], lim),
+                (3, vec![], price),
+                (4, vec![1], vec![1, 2]),
+            ],
             &[],
         );
         let r = review_message(&m, &ctx(&u, &[]), |_| Ok(None));
         let got = rules(&r);
-        assert!(got.contains(&"R13") && got.contains(&"R14") && got.contains(&"R6"), "{got:?}");
+        assert!(
+            got.contains(&"R13") && got.contains(&"R14") && got.contains(&"R6"),
+            "{got:?}"
+        );
         assert!(!r.blocked() && r.needs_ack());
     }
 
@@ -1178,14 +1692,28 @@ mod tests {
             lim.extend_from_slice(&1_400_000u32.to_le_bytes());
             let mut price = vec![3u8];
             price.extend_from_slice(&price_micro.to_le_bytes());
-            msg(None, [1, 0, 2], &[user, cb, pk(ProgramIds::MEMO)], &[(1, vec![], lim), (1, vec![], price), (2, vec![], b"hi".to_vec())], &[])
+            msg(
+                None,
+                [1, 0, 2],
+                &[user, cb, pk(ProgramIds::MEMO)],
+                &[
+                    (1, vec![], lim),
+                    (1, vec![], price),
+                    (2, vec![], b"hi".to_vec()),
+                ],
+                &[],
+            )
         };
         // 1.4M CU × 40M µL = 0.056 SOL, over the 0.05 SOL cap → BLOCK R14b.
         let r = review_message(&fee_msg(40_000_000), &ctx(&u, &[]), |_| Ok(None));
         assert!(r.blocked(), "{:?}", rules(&r));
         assert_eq!(r.first_block().unwrap().rule, "R14b");
         // 1.4M CU × 10M µL = 0.014 SOL → warn only.
-        let r = review_message(&fee_msg(crate::fees::MAX_MICRO_LAMPORTS), &ctx(&u, &[]), |_| Ok(None));
+        let r = review_message(
+            &fee_msg(crate::fees::MAX_MICRO_LAMPORTS),
+            &ctx(&u, &[]),
+            |_| Ok(None),
+        );
         assert!(!r.blocked() && rules(&r).contains(&"R14"));
         // A lower per-wallet max (policy) is honoured; a higher one is clamped to the vault max.
         let mut c = ctx(&u, &[]);
@@ -1202,7 +1730,9 @@ mod tests {
     /// rules cleanly and decode with readable names; withdrawing elsewhere still blocks.
     #[test]
     fn vault_stake_flows_pass_rules_and_decode() {
-        use crate::tx::{create_account, stake_deactivate, stake_delegate, stake_initialize, stake_withdraw};
+        use crate::tx::{
+            create_account, stake_deactivate, stake_delegate, stake_initialize, stake_withdraw,
+        };
         let user = b58(&rnd());
         let stake = b58(&rnd());
         let vote = b58(&rnd());
@@ -1218,14 +1748,23 @@ mod tests {
         let del = stake_delegate(&stake, &vote, &user);
         let r = review(vec![create, init, del]);
         assert!(!r.blocked() && !r.needs_ack(), "{:?}", r.findings);
-        assert!(r.instruction_lines.iter().any(|l| l.contains("Initialize stake")));
-        assert!(r.instruction_lines.iter().any(|l| l.contains("Delegate stake") && l.contains("validator")));
+        assert!(r
+            .instruction_lines
+            .iter()
+            .any(|l| l.contains("Initialize stake")));
+        assert!(r
+            .instruction_lines
+            .iter()
+            .any(|l| l.contains("Delegate stake") && l.contains("validator")));
         let r = review(vec![stake_deactivate(&stake, &user)]);
         assert!(!r.blocked() && !r.needs_ack(), "{:?}", r.findings);
         assert!(r.instruction_lines[0].contains("Deactivate stake"));
         let r = review(vec![stake_withdraw(&stake, &user, &user, 5)]);
         assert!(!r.blocked() && !r.needs_ack(), "{:?}", r.findings);
-        assert!(r.instruction_lines[0].contains("Withdraw stake") && r.instruction_lines[0].contains("5 lamports"));
+        assert!(
+            r.instruction_lines[0].contains("Withdraw stake")
+                && r.instruction_lines[0].contains("5 lamports")
+        );
         // Same withdraw, but to someone else: still R5 BLOCK.
         let thief = b58(&rnd());
         let r = review(vec![stake_withdraw(&stake, &thief, &user, 5)]);
@@ -1244,9 +1783,19 @@ mod tests {
         d.extend_from_slice(&i64::MAX.to_le_bytes());
         d.push(0);
         d.push(0);
-        let m = msg(None, [1, 0, 1], &[user, sa, stake], &[(2, vec![1, 0], d)], &[]);
+        let m = msg(
+            None,
+            [1, 0, 1],
+            &[user, sa, stake],
+            &[(2, vec![1, 0], d)],
+            &[],
+        );
         let r = review_message(&m, &ctx(&u, &[]), |_| Ok(None));
-        assert!(rules(&r).contains(&"R5b") && r.needs_ack() && !r.blocked(), "{:?}", r.findings);
+        assert!(
+            rules(&r).contains(&"R5b") && r.needs_ack() && !r.blocked(),
+            "{:?}",
+            r.findings
+        );
         assert!(r.instruction_lines[0].contains("Set stake lockup"));
         for op in 0u32..=17 {
             let ix = Instruction {
@@ -1263,7 +1812,13 @@ mod tests {
     fn not_a_signer_blocks() {
         let user = rnd();
         let someone = rnd();
-        let m = msg(None, [1, 0, 1], &[someone, pk(ProgramIds::MEMO)], &[(1, vec![], b"hi".to_vec())], &[]);
+        let m = msg(
+            None,
+            [1, 0, 1],
+            &[someone, pk(ProgramIds::MEMO)],
+            &[(1, vec![], b"hi".to_vec())],
+            &[],
+        );
         let r = review_message(&m, &ctx(&b58(&user), &[]), |_| Ok(None));
         assert_eq!(r.first_block().unwrap().rule, "SIGNER");
     }
@@ -1271,7 +1826,13 @@ mod tests {
     #[test]
     fn batch_one_block_blocks_all() {
         let user = rnd();
-        let ok = msg(None, [1, 0, 1], &[user, pk(ProgramIds::MEMO)], &[(1, vec![], b"hi".to_vec())], &[]);
+        let ok = msg(
+            None,
+            [1, 0, 1],
+            &[user, pk(ProgramIds::MEMO)],
+            &[(1, vec![], b"hi".to_vec())],
+            &[],
+        );
         let (bad, _t, _d, _u, _v) = drainer_v0();
         let wire = |m: &[u8]| {
             let mut w = vec![1u8];
@@ -1280,7 +1841,9 @@ mod tests {
             w
         };
         let u = b58(&user);
-        let out = review_batch(&[wire(&ok), wire(&bad)], &ctx(&u, &[]), |_| Err("down".into()));
+        let out = review_batch(&[wire(&ok), wire(&bad)], &ctx(&u, &[]), |_| {
+            Err("down".into())
+        });
         assert!(out[0].blocked() && out[1].blocked());
         assert!(rules(&out[0]).contains(&"R10"));
     }
@@ -1289,7 +1852,9 @@ mod tests {
     fn sign_message_payload_that_is_a_tx_is_detected() {
         let (m, _t, _d, _u, _v) = drainer_v0();
         assert!(message_payload_is_transaction(&m));
-        assert!(!message_payload_is_transaction(b"Sign in to example.com\nNonce: 123"));
+        assert!(!message_payload_is_transaction(
+            b"Sign in to example.com\nNonce: 123"
+        ));
     }
 
     #[test]
@@ -1319,19 +1884,282 @@ mod tests {
             .iter()
             .filter(|a| matches!(a.source, AccountSource::Lookup { .. }))
             .collect();
-        let want_w: Vec<&str> = fx["loadedAddresses"]["writable"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        let want_r: Vec<&str> = fx["loadedAddresses"]["readonly"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        let got_w: Vec<&str> = loaded.iter().filter(|a| a.writable).map(|a| a.pubkey.as_str()).collect();
-        let got_r: Vec<&str> = loaded.iter().filter(|a| !a.writable).map(|a| a.pubkey.as_str()).collect();
+        let want_w: Vec<&str> = fx["loadedAddresses"]["writable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let want_r: Vec<&str> = fx["loadedAddresses"]["readonly"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let got_w: Vec<&str> = loaded
+            .iter()
+            .filter(|a| a.writable)
+            .map(|a| a.pubkey.as_str())
+            .collect();
+        let got_r: Vec<&str> = loaded
+            .iter()
+            .filter(|a| !a.writable)
+            .map(|a| a.pubkey.as_str())
+            .collect();
         assert_eq!(got_w, want_w);
         assert_eq!(got_r, want_r);
         let user = res.accounts[0].pubkey.clone();
         let r = review_wire(&wire, &ctx(&user, &[]), fetch);
-        assert!(!r.findings.iter().any(|x| x.rule == "R15"), "{:?}", r.findings);
+        assert!(
+            !r.findings.iter().any(|x| x.rule == "R15"),
+            "{:?}",
+            r.findings
+        );
         assert_eq!(r.lookup_accounts, want_w.len() + want_r.len());
-        assert_eq!(r.account_lines.len(), parsed.static_keys.len() + want_w.len() + want_r.len());
+        assert_eq!(
+            r.account_lines.len(),
+            parsed.static_keys.len() + want_w.len() + want_r.len()
+        );
         // Same bytes, table unreachable: blocked.
         let r = review_wire(&wire, &ctx(&user, &[]), |_| Err("timeout".into()));
         assert!(r.blocked());
+    }
+
+    fn transfer_data(lamports: u64) -> Vec<u8> {
+        let mut data = Vec::with_capacity(12);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&lamports.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn v1_transfer_reviews_as_v1_and_signs_the_tail() {
+        let payer = Keypair::generate();
+        let to = rnd();
+        let message = v1_transfer_message(&payer.public_bytes(), &to, 1_000, Some(5_000), 0);
+        assert_eq!(message[0], V1_PREFIX);
+        let parsed = parse_message(&message).unwrap();
+        assert_eq!(parsed.version, Some(1));
+        assert_eq!(parsed.v1.unwrap().priority_fee_lamports, 5_000);
+        assert!(parsed.lookups.is_empty());
+        let user = payer.address();
+        let review = review_message(&message, &ctx(&user, &[]), |_| Ok(None));
+        assert_eq!(review.version, "v1");
+        assert!(
+            review
+                .instruction_lines
+                .iter()
+                .any(|l| l.contains("Transfer SOL")),
+            "{:?}",
+            review.instruction_lines
+        );
+        assert!(review.account_lines[0].contains("signer"));
+        assert!(!review.blocked(), "{:?}", review.findings);
+
+        let mut wire = v1_with_sigs(&message);
+        let msg_len = message.len();
+        tx::sign_wire_transaction(&mut wire, &payer).unwrap();
+        assert_eq!(&wire[..msg_len], message.as_slice());
+        let sig = tx::first_signature(&wire).unwrap();
+        assert_eq!(&sig, &wire[msg_len..msg_len + 64]);
+        assert!(Keypair::verify(&payer.public_bytes(), &message, &sig));
+        let (_, split) = split_wire(&wire).unwrap();
+        assert_eq!(split, message.as_slice());
+        assert!(message_payload_is_transaction(&message));
+        assert!(message_payload_is_transaction(&wire));
+    }
+
+    #[test]
+    fn v1_second_signer_slot_is_the_second_tail_signature() {
+        let fee = Keypair::generate();
+        let user = Keypair::generate();
+        let system = pk(ProgramIds::SYSTEM);
+        let message = v1_message_raw(
+            [2, 0, 1],
+            0,
+            &[fee.public_bytes(), user.public_bytes(), system],
+            &[],
+            &[],
+            0,
+        );
+        let mut wire = message.clone();
+        wire.extend_from_slice(&[1u8; 64]);
+        wire.extend_from_slice(&[0u8; 64]);
+        let first = wire[message.len()..message.len() + 64].to_vec();
+        tx::sign_wire_transaction(&mut wire, &user).unwrap();
+        assert_eq!(&wire[message.len()..message.len() + 64], first.as_slice());
+        let sig = &wire[message.len() + 64..message.len() + 128];
+        assert!(Keypair::verify(
+            &user.public_bytes(),
+            &message,
+            sig.try_into().unwrap()
+        ));
+    }
+
+    #[test]
+    fn v1_header_fee_is_the_only_fee_the_vault_uses() {
+        let payer = Keypair::generate();
+        let to = rnd();
+        let system = pk(ProgramIds::SYSTEM);
+        let budget = pk(ProgramIds::COMPUTE_BUDGET);
+        let transfer = transfer_data(1);
+        // SetComputeUnitPrice of 300_000_000 µ-lamports would be over the cap
+        // on a legacy message. The header fee of 1,000 lamports is the real one.
+        let price = {
+            let mut d = vec![3u8];
+            d.extend_from_slice(&300_000_000u64.to_le_bytes());
+            d
+        };
+        let mut config = Vec::new();
+        config.extend_from_slice(&1_000u64.to_le_bytes());
+        let message = v1_message_raw(
+            [1, 0, 2],
+            0b11,
+            &[payer.public_bytes(), to, system, budget],
+            &config,
+            &[
+                (2, &[0, 1], transfer.as_slice()),
+                (3, &[], price.as_slice()),
+            ],
+            0,
+        );
+        let parsed = parse_message(&message).unwrap();
+        assert_eq!(parsed.v1.unwrap().priority_fee_lamports, 1_000);
+        assert_eq!(parsed.instructions.len(), 2);
+        let mut wire = v1_with_sigs(&message);
+        assert!(tx::sign_wire_transaction(&mut wire, &payer).is_ok());
+        let review = review_message(&message, &ctx(&payer.address(), &[]), |_| Ok(None));
+        assert!(!rules(&review).contains(&"R14b"), "{:?}", review.findings);
+
+        let mut over = config.clone();
+        over[..8].copy_from_slice(&50_000_001u64.to_le_bytes());
+        let fat = v1_message_raw(
+            [1, 0, 1],
+            0b11,
+            &[payer.public_bytes(), to, system],
+            &over,
+            &[(2, &[0, 1], transfer.as_slice())],
+            0,
+        );
+        let err = tx::sign_wire_transaction(&mut v1_with_sigs(&fat), &payer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("R14b"), "{err}");
+        let review = review_message(&fat, &ctx(&payer.address(), &[]), |_| Ok(None));
+        let block = review.first_block().unwrap();
+        assert_eq!(block.rule, "R14b");
+        assert!(!block.text.contains("µ-lamports"), "{}", block.text);
+
+        let mut warn_cfg = config.clone();
+        warn_cfg[..8].copy_from_slice(&10_000_001u64.to_le_bytes());
+        let warned = v1_message_raw(
+            [1, 0, 1],
+            0b11,
+            &[payer.public_bytes(), to, system],
+            &warn_cfg,
+            &[(2, &[0, 1], transfer.as_slice())],
+            0,
+        );
+        let review = review_message(&warned, &ctx(&payer.address(), &[]), |_| Ok(None));
+        assert!(rules(&review).contains(&"R14"), "{:?}", review.findings);
+        assert!(!review.blocked());
+        assert!(tx::sign_wire_transaction(&mut v1_with_sigs(&warned), &payer).is_ok());
+    }
+
+    #[test]
+    fn v1_rejects_bad_masks_limits_and_size() {
+        let a = rnd();
+        let b = rnd();
+        let system = pk(ProgramIds::SYSTEM);
+        let transfer = transfer_data(1);
+        let base = |mask: u32, config: &[u8]| {
+            v1_message_raw(
+                [1, 0, 1],
+                mask,
+                &[a, b, system],
+                config,
+                &[(2, &[0, 1], transfer.as_slice())],
+                0,
+            )
+        };
+        assert!(parse_message(&base(0b01, &[]))
+            .unwrap_err()
+            .contains("both header bits"));
+        assert!(parse_message(&base(0b10, &[]))
+            .unwrap_err()
+            .contains("both header bits"));
+        assert!(parse_message(&base(1 << 5, &[]))
+            .unwrap_err()
+            .contains("unknown field"));
+        let heap_bad = 1025u32.to_le_bytes();
+        assert!(parse_message(&base(0b1_0000, &heap_bad))
+            .unwrap_err()
+            .contains("heap"));
+        assert!(parse_message(&base(0b1_0000, &(31 * 1024u32).to_le_bytes())).is_err());
+        assert!(parse_message(&base(0b1_0000, &(257 * 1024u32).to_le_bytes())).is_err());
+        assert!(parse_message(&base(0b1_0000, &(32 * 1024u32).to_le_bytes())).is_ok());
+        assert!(parse_message(&base(0b1_0000, &(256 * 1024u32).to_le_bytes())).is_ok());
+
+        let mut keys = vec![a];
+        while keys.len() < 65 {
+            keys.push(rnd());
+        }
+        let too_many = v1_message_raw([1, 0, 0], 0, &keys, &[], &[], 0);
+        assert!(parse_message(&too_many)
+            .unwrap_err()
+            .contains("address count"));
+
+        let mut ixs = Vec::new();
+        let empty: &[u8] = &[];
+        for _ in 0..65 {
+            ixs.push((1u8, empty, empty));
+        }
+        let ix_refs: Vec<(u8, &[u8], &[u8])> = ixs.iter().map(|(p, a, d)| (*p, *a, *d)).collect();
+        let too_many_ix = v1_message_raw([1, 0, 1], 0, &[a, system], &[], &ix_refs, 0);
+        assert!(parse_message(&too_many_ix)
+            .unwrap_err()
+            .contains("64 instructions"));
+
+        let thirteen = v1_message_raw([13, 0, 0], 0, &[a], &[], &[], 0);
+        assert!(parse_message(&thirteen)
+            .unwrap_err()
+            .contains("signature count"));
+        let dup = v1_message_raw([1, 0, 0], 0, &[a, a], &[], &[], 0);
+        assert!(parse_message(&dup).unwrap_err().contains("duplicate"));
+        let payer_program = v1_message_raw([1, 0, 0], 0, &[a, system], &[], &[(0, &[1], empty)], 0);
+        assert!(parse_message(&payer_program)
+            .unwrap_err()
+            .contains("fee payer"));
+        let trailed = v1_message_raw(
+            [1, 0, 1],
+            0,
+            &[a, b, system],
+            &[],
+            &[(2, &[0, 1], transfer.as_slice())],
+            1,
+        );
+        assert!(parse_message(&trailed).unwrap_err().contains("trailing"));
+
+        let wide = v1_transfer_message(&a, &b, 1, None, 2_000);
+        assert!(wide.len() > PACKET_DATA_SIZE);
+        assert!(wide.len() + 64 <= V1_MAX_TRANSACTION_SIZE);
+        assert!(parse_message(&wide).is_ok());
+        assert!(split_wire(&v1_with_sigs(&wide)).is_ok());
+        let huge = v1_transfer_message(&a, &b, 1, None, 4_000);
+        assert!(parse_message(&huge).unwrap_err().contains("4096"));
+        let mut over_wire = v1_with_sigs(&wide);
+        over_wire.extend(std::iter::repeat(0u8).take(V1_MAX_TRANSACTION_SIZE));
+        assert!(split_wire(&over_wire).unwrap_err().contains("4096"));
+
+        let from = tx::encode_pubkey(&a);
+        let hash = tx::encode_pubkey(&rnd());
+        let memo = tx::Instruction {
+            program_id: ProgramIds::MEMO.into(),
+            accounts: vec![tx::AccountMeta::readonly_signer(&from)],
+            data: vec![1u8; 1_300],
+        };
+        let legacy = tx::compile_legacy_message(&from, &hash, &[memo]).unwrap();
+        assert!(legacy.len() > PACKET_DATA_SIZE);
+        assert!(parse_message(&legacy).unwrap_err().contains("packet"));
     }
 }

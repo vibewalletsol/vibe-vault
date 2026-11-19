@@ -4,7 +4,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: VIBE Wallet 1.9.0\n"
+"Project-Id-Version: VIBE Wallet 1.9.1\n"
 "Report-Msgid-Bugs-To: https://oldgrowthcrypto.com\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
@@ -72,11 +72,11 @@ msgstr ""
 msgid "Save"
 msgstr ""
 
-#: crates/vibe-ui/src/pages/settings.rs:85 crates/vibe-ui/src/window.rs:434
+#: crates/vibe-ui/src/pages/settings.rs:85 crates/vibe-ui/src/window.rs:444
 msgid "Lock vault"
 msgstr ""
 
-#: crates/vibe-ui/src/pages/settings.rs:87 crates/vibe-ui/src/window.rs:435
+#: crates/vibe-ui/src/pages/settings.rs:87 crates/vibe-ui/src/window.rs:445
 msgid "About VIBE Wallet"
 msgstr ""
 
@@ -272,6 +272,6 @@ msgstr ""
 msgid "Confirm send"
 msgstr ""
 
-#: crates/vibe-ui/src/window.rs:436
+#: crates/vibe-ui/src/window.rs:446
 msgid "Quit"
 msgstr ""

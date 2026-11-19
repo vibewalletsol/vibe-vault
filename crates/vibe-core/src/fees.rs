@@ -31,7 +31,10 @@ pub const PRESETS: &[(&str, &str, u64)] = &[
 
 pub fn preset_micro(id: &str) -> Option<u64> {
     let id = id.trim().to_ascii_lowercase();
-    PRESETS.iter().find(|(k, _, _)| *k == id).map(|(_, _, v)| *v)
+    PRESETS
+        .iter()
+        .find(|(k, _, _)| *k == id)
+        .map(|(_, _, v)| *v)
 }
 
 /// Total priority fee in lamports, rounded up like the runtime does. The runtime clamps
@@ -61,9 +64,11 @@ fn sol(l: u64) -> String {
     format!("{:.4}", l as f64 / LAMPORTS_PER_SOL as f64)
 }
 
-/// Check a (units, price) pair against the vault cap (total lamports).
-pub fn check_fee(units: u32, micro_lamports: u64) -> FeeVerdict {
-    let total = priority_fee_lamports(units, micro_lamports);
+/// Check a total priority fee in lamports against the vault cap.
+///
+/// Legacy and v0 arrive here after `priority_fee_lamports`. Version 1 already
+/// stores the total in the header, so it is compared directly.
+pub fn check_fee_lamports(total: u64) -> FeeVerdict {
     if total > MAX_PRIORITY_FEE_LAMPORTS {
         return FeeVerdict::Block(format!(
             "Priority fee {} SOL is above the vault maximum of {} SOL.",
@@ -77,11 +82,18 @@ pub fn check_fee(units: u32, micro_lamports: u64) -> FeeVerdict {
     FeeVerdict::Ok
 }
 
+/// Check a (units, price) pair against the vault cap (total lamports).
+pub fn check_fee(units: u32, micro_lamports: u64) -> FeeVerdict {
+    check_fee_lamports(priority_fee_lamports(units, micro_lamports))
+}
+
 /// Validate a price typed into the Confirm custom field (units = the CU limit the vault
 /// will set). Returns the verdict for the resulting fee, or an input error.
 pub fn check_custom(units: u32, micro_lamports: u64) -> Result<FeeVerdict, String> {
     if micro_lamports > MAX_MICRO_LAMPORTS {
-        return Err(format!("Custom price is capped at {MAX_MICRO_LAMPORTS} µ-lamports/CU."));
+        return Err(format!(
+            "Custom price is capped at {MAX_MICRO_LAMPORTS} µ-lamports/CU."
+        ));
     }
     Ok(check_fee(units, micro_lamports))
 }
@@ -111,7 +123,11 @@ fn group(n: u64) -> String {
 
 /// Parse a user-typed micro-lamport value ("25,000", " 1000 "). Rejects junk and zero-length.
 pub fn parse_micro(text: &str) -> Option<u64> {
-    let t: String = text.trim().chars().filter(|c| *c != ',' && *c != '_' && *c != ' ').collect();
+    let t: String = text
+        .trim()
+        .chars()
+        .filter(|c| *c != ',' && *c != '_' && *c != ' ')
+        .collect();
     if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -122,6 +138,10 @@ pub fn parse_micro(text: &str) -> Option<u64> {
 /// runtime default (200k per non-budget instruction, max 1.4M).
 pub fn budget_from_message(message: &[u8]) -> Option<(u32, u64)> {
     let parsed = crate::txcheck::parse_message(message).ok()?;
+    // Version 1 fees live in the header. A Compute Budget instruction there is a no-op.
+    if parsed.v1.is_some() {
+        return None;
+    }
     let budget = crate::ProgramIds::COMPUTE_BUDGET;
     let mut limit: Option<u32> = None;
     let mut price: u64 = 0;
@@ -149,13 +169,25 @@ pub fn budget_from_message(message: &[u8]) -> Option<(u32, u64)> {
             _ => {}
         }
     }
-    let units = limit.unwrap_or_else(|| (non_budget.saturating_mul(DEFAULT_UNITS_PER_IX)).min(MAX_UNITS));
+    let units =
+        limit.unwrap_or_else(|| (non_budget.saturating_mul(DEFAULT_UNITS_PER_IX)).min(MAX_UNITS));
     Some((units, price))
 }
 
 /// Vault sign-time fee gate on the exact message bytes. Non-transaction payloads
-/// (signMessage text) pass: they carry no fee.
+/// (signMessage text) pass: they carry no fee. A version 1 blob that does not
+/// parse is refused, so an unreadable header fee cannot slip through.
 pub fn check_message(message: &[u8]) -> Result<(), String> {
+    if message.first() == Some(&crate::txcheck::V1_PREFIX) {
+        let parsed = crate::txcheck::parse_message(message).map_err(|e| {
+            format!("Blocked by the vault [R15]: VIBE can't read this version 1 transaction: {e}.")
+        })?;
+        let total = parsed.v1.map(|b| b.priority_fee_lamports).unwrap_or(0);
+        return match check_fee_lamports(total) {
+            FeeVerdict::Block(e) => Err(format!("Blocked by the vault [R14b]: {e}")),
+            _ => Ok(()),
+        };
+    }
     match budget_from_message(message) {
         Some((units, price)) => match check_fee(units, price) {
             FeeVerdict::Block(e) => Err(format!("Blocked by the vault [R14b]: {e}")),
@@ -165,8 +197,13 @@ pub fn check_message(message: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Message bytes of a base64 wire transaction (signatures stripped).
+/// Message bytes of a wire transaction (signatures stripped).
 pub fn wire_message(tx: &[u8]) -> Option<&[u8]> {
+    if tx.first() == Some(&crate::txcheck::V1_PREFIX) {
+        return crate::txcheck::split_wire(tx)
+            .ok()
+            .map(|(_, message)| message);
+    }
     let mut off = 0usize;
     let mut n: usize = 0;
     let mut shift = 0;
@@ -187,7 +224,12 @@ pub fn wire_message(tx: &[u8]) -> Option<&[u8]> {
 
 /// Priority fee (lamports) of a wire transaction, from its exact bytes.
 pub fn wire_priority_lamports(tx: &[u8]) -> Option<u64> {
-    let (units, price) = budget_from_message(wire_message(tx)?)?;
+    let message = wire_message(tx)?;
+    if message.first() == Some(&crate::txcheck::V1_PREFIX) {
+        let parsed = crate::txcheck::parse_message(message).ok()?;
+        return parsed.v1.map(|b| b.priority_fee_lamports);
+    }
+    let (units, price) = budget_from_message(message)?;
     Some(priority_fee_lamports(units, price))
 }
 
@@ -198,7 +240,9 @@ pub fn check_wire_against(tx_b64: &str, picked_lamports: u64) -> Result<(), Stri
     let msg = wire_message(&bytes).ok_or("transaction truncated")?;
     check_message(msg)?;
     let actual = wire_priority_lamports(&bytes).unwrap_or(0);
-    let ceiling = picked_lamports.saturating_add(picked_lamports / 10).saturating_add(5_000);
+    let ceiling = picked_lamports
+        .saturating_add(picked_lamports / 10)
+        .saturating_add(5_000);
     if actual > ceiling {
         return Err(format!(
             "Blocked by the vault [R14b]: the swap carries a {:.6} SOL priority fee, above the {:.6} SOL you picked.",
@@ -219,14 +263,20 @@ mod tests {
         assert_eq!(priority_fee_lamports(200_000, 25_000), 5_000);
         assert_eq!(priority_fee_lamports(1, 1), 1);
         assert_eq!(priority_fee_lamports(0, 1_000_000), 0);
-        assert_eq!(priority_fee_lamports(1_400_000, MAX_MICRO_LAMPORTS), 14_000_000);
+        assert_eq!(
+            priority_fee_lamports(1_400_000, MAX_MICRO_LAMPORTS),
+            14_000_000
+        );
         // CU limit is clamped to the runtime max.
         assert_eq!(priority_fee_lamports(u32::MAX, 1_000_000), 1_400_000);
     }
 
     #[test]
     fn describe_and_custom() {
-        assert_eq!(describe(80_000, 25_000), "Priority fee · 25,000 µ-lamports/CU × 80,000 CU ≈ 0.000002 SOL");
+        assert_eq!(
+            describe(80_000, 25_000),
+            "Priority fee · 25,000 µ-lamports/CU × 80,000 CU ≈ 0.000002 SOL"
+        );
         assert_eq!(group(1_400_000), "1,400,000");
         assert!(check_custom(80_000, MAX_MICRO_LAMPORTS + 1).is_err());
         assert_eq!(check_custom(80_000, 1_000), Ok(FeeVerdict::Ok));
@@ -248,7 +298,10 @@ mod tests {
         // A Jupiter-style high price on a small CU limit is fine: 100k CU × 50M µL = 0.005 SOL.
         assert!(!check_fee(100_000, 50_000_000).is_block());
         // 1.4M CU at 8M µL = 11.2M lamports → warn (over 0.01 SOL), under 0.05
-        assert!(matches!(check_fee(1_400_000, 8_000_000), FeeVerdict::Warn(_)));
+        assert!(matches!(
+            check_fee(1_400_000, 8_000_000),
+            FeeVerdict::Warn(_)
+        ));
         // 1.4M CU at 40M µL = 0.056 SOL → block.
         assert!(check_fee(1_400_000, 40_000_000).is_block());
         assert!(check_fee(u32::MAX, 40_000_000).is_block());
@@ -302,5 +355,18 @@ mod tests {
         assert!(check_message(&msg_with(None, 300_000_000)).is_err());
         // Text payloads pass (signMessage).
         assert!(check_message(b"hello").is_ok());
+    }
+
+    #[test]
+    fn v1_wire_fee_is_the_header_total() {
+        let payer = crate::keypair::Keypair::generate().public_bytes();
+        let to = crate::keypair::Keypair::generate().public_bytes();
+        let message = crate::txcheck::v1_transfer_message(&payer, &to, 1, Some(12_000), 0);
+        let wire = crate::txcheck::v1_with_sigs(&message);
+        assert_eq!(wire_priority_lamports(&wire), Some(12_000));
+        assert!(check_message(&message).is_ok());
+        let over = crate::txcheck::v1_transfer_message(&payer, &to, 1, Some(50_000_001), 0);
+        assert!(check_message(&over).unwrap_err().contains("R14b"));
+        assert!(check_message(&[0x81, 0x01]).unwrap_err().contains("R15"));
     }
 }

@@ -7,7 +7,7 @@
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: VIBE Wallet 1.9.0\n"
+"Project-Id-Version: VIBE Wallet 1.9.1\n"
 "Report-Msgid-Bugs-To: https://oldgrowthcrypto.com\n"
 "PO-Revision-Date: 2026-09-28 17:30-0700\n"
 "Last-Translator: machine draft (AI assistant), not reviewed\n"
@@ -82,11 +82,11 @@ msgstr "Chave de API do CoinGecko (opcional, demo/pro)"
 msgid "Save"
 msgstr "Salvar"
 
-#: crates/vibe-ui/src/pages/settings.rs:85 crates/vibe-ui/src/window.rs:434
+#: crates/vibe-ui/src/pages/settings.rs:85 crates/vibe-ui/src/window.rs:444
 msgid "Lock vault"
 msgstr "Bloquear o cofre"
 
-#: crates/vibe-ui/src/pages/settings.rs:87 crates/vibe-ui/src/window.rs:435
+#: crates/vibe-ui/src/pages/settings.rs:87 crates/vibe-ui/src/window.rs:445
 msgid "About VIBE Wallet"
 msgstr "Sobre o VIBE Wallet"
 
@@ -282,6 +282,6 @@ msgstr "Confirmar stake"
 msgid "Confirm send"
 msgstr "Confirmar envio"
 
-#: crates/vibe-ui/src/window.rs:436
+#: crates/vibe-ui/src/window.rs:446
 msgid "Quit"
 msgstr "Sair"

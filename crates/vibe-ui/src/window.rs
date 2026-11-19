@@ -133,7 +133,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
         if manage {
             560
         } else if signer {
-            430
+            520
         } else {
             820
         },
@@ -147,7 +147,7 @@ pub fn build(app: &adw::Application) -> adw::ApplicationWindow {
             window.set_size_request(340, 480);
         } else {
             window.set_resizable(false);
-            window.set_size_request(340, 440);
+            window.set_size_request(340, 420);
         }
     }
 
@@ -396,7 +396,17 @@ fn build_signer(
 
     if let Ok(path) = std::env::var("VIBE_SCREENSHOT") {
         let win_shot = window.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(800), move || {
+        let ms = std::env::var("VIBE_SCREENSHOT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(800);
+        glib::timeout_add_local(std::time::Duration::from_millis(ms), move || {
+            eprintln!(
+                "vibe-vault: window {}x{}",
+                win_shot.width(),
+                win_shot.height()
+            );
             if let Err(err) = capture_window(&win_shot, &path) {
                 eprintln!("vibe-vault: screenshot failed: {err}");
             }

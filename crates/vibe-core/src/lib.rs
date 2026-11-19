@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod agents;
 pub mod trezor;
 pub mod mnemonic;
+pub mod offchain;
 pub mod policy;
 pub mod programs;
 pub mod rpc;

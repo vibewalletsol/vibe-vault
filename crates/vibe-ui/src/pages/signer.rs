@@ -24,7 +24,11 @@ fn env_flag(key: &str) -> bool {
 }
 
 fn env_u32(key: &str, fallback: u32) -> u32 {
-    env_trim(key).parse().ok().filter(|v| *v > 0).unwrap_or(fallback)
+    env_trim(key)
+        .parse()
+        .ok()
+        .filter(|v| *v > 0)
+        .unwrap_or(fallback)
 }
 
 fn env_u64(key: &str, fallback: u64) -> u64 {
@@ -195,7 +199,10 @@ fn env_sol_amount(k: Kind) -> f64 {
     let raw = match k {
         Kind::Send if is_native_mint(&env_trim("VIBE_SEND_MINT")) => env_trim("VIBE_SEND_AMOUNT"),
         Kind::Mass if is_native_mint(&env_trim("VIBE_SEND_MINT")) => {
-            let each = env_trim("VIBE_SEND_AMOUNT").replace(',', "").parse::<f64>().unwrap_or(0.0);
+            let each = env_trim("VIBE_SEND_AMOUNT")
+                .replace(',', "")
+                .parse::<f64>()
+                .unwrap_or(0.0);
             let n = env_trim("VIBE_MASS_COUNT").parse::<f64>().unwrap_or(0.0);
             return each * n;
         }
@@ -244,14 +251,22 @@ fn review_mints(k: Kind) -> Vec<String> {
     out
 }
 
-fn collect_review(k: Kind, rec: vibe_core::store::WalletRecord, rpc: vibe_core::Rpc) -> ReviewPaint {
+fn collect_review(
+    k: Kind,
+    rec: vibe_core::store::WalletRecord,
+    rpc: vibe_core::Rpc,
+) -> ReviewPaint {
     let mut paint = ReviewPaint::default();
     match agent_task_check(&rec) {
         Ok(Some(task)) => paint.warns.push(format!(
             "Requested by AI agent “{}” (task {}, {}). Check every detail before you sign.",
             task.agent_name,
             task.id,
-            if task.approved_by_human { "approved on the desk" } else { "within its caps" }
+            if task.approved_by_human {
+                "approved on the desk"
+            } else {
+                "within its caps"
+            }
         )),
         Ok(None) => {}
         Err(e) => {
@@ -276,26 +291,35 @@ fn collect_review(k: Kind, rec: vibe_core::store::WalletRecord, rpc: vibe_core::
         let n = env_trim("VIBE_MASS_COUNT").if_empty("0");
         let each = env_trim("VIBE_SEND_AMOUNT").if_empty("0");
         let sym = env_trim("VIBE_SEND_SYMBOL").if_empty("TOKEN");
-        paint.infos.push(format!("{n} wallets × {each} {sym} each."));
+        paint
+            .infos
+            .push(format!("{n} wallets × {each} {sym} each."));
         paint.warns.push("Each batch is its own transaction. Failed batches after the first still spend the ones that landed.".into());
     }
     if k == Kind::Bot {
         let n = env_trim("VIBE_BOT_COUNT").if_empty("0");
         let mode = env_trim("VIBE_BOT_MODE").if_empty("volume");
         let sym = env_trim("VIBE_BOT_SYMBOL").if_empty("TOKEN");
-        paint.infos.push(format!("Trading bot · {mode} · {n} trades · {sym}."));
-        paint.warns.push("Leave this vault window open while the bot runs. Closing it stops the task.".into());
+        paint
+            .infos
+            .push(format!("Trading bot · {mode} · {n} trades · {sym}."));
+        paint.warns.push(
+            "Leave this vault window open while the bot runs. Closing it stops the task.".into(),
+        );
     }
     if k == Kind::Reclaim {
         let n = env_trim("VIBE_RECLAIM_COUNT").if_empty("0");
         let sol_s = env_trim("VIBE_RECLAIM_SOL").if_empty("0");
-        paint.infos.push(format!("You get back {sol_s} SOL from {n} account(s)."));
+        paint
+            .infos
+            .push(format!("You get back {sol_s} SOL from {n} account(s)."));
     }
     if k == Kind::Wc {
         match wc_request() {
             Ok(req) => {
                 let reviews = review_wc_request(&req, &rec, &rpc);
                 paint_wc_reviews(&mut paint, &reviews);
+                block_hardware_v1(&mut paint, &rec, &reviews);
                 // 1.9 F8: extra, display-only Anchor IDL lines (never part of the review
                 // or the pre-sign re-check above).
                 let idl = anchor_idl_lines(&req, &rpc);
@@ -378,7 +402,9 @@ fn reload_active_record(ctx: &Ctx) -> Option<vibe_core::store::WalletRecord> {
 
 /// 1.9: a Confirm opened for an AI agent task (`VIBE_AGENT_TASK`) is re-checked against the
 /// vault agent policy: agent not revoked, bound to this wallet, same parameters, caps.
-fn agent_task_check(rec: &vibe_core::store::WalletRecord) -> Result<Option<vibe_core::agents::Task>, String> {
+fn agent_task_check(
+    rec: &vibe_core::store::WalletRecord,
+) -> Result<Option<vibe_core::agents::Task>, String> {
     let task = env_trim("VIBE_AGENT_TASK");
     if task.is_empty() {
         return Ok(None);
@@ -430,9 +456,34 @@ fn label_line(text: &str, class: &str) -> gtk::Label {
     let lab = gtk::Label::new(Some(text));
     lab.add_css_class(class);
     lab.set_wrap(true);
+    lab.set_wrap_mode(pango::WrapMode::WordChar);
+    lab.set_halign(gtk::Align::Fill);
+    lab.set_hexpand(true);
     lab.set_xalign(0.0);
     lab.set_max_width_chars(42);
     lab
+}
+
+/// Centered wrapping line. `halign: center` on a wrapping label sizes it to the
+/// longest word, which stacked the dApp summary one phrase per line.
+fn center_wrap(text: &str, class: &str) -> gtk::Label {
+    let lab = gtk::Label::new(Some(text));
+    lab.add_css_class(class);
+    lab.set_wrap(true);
+    lab.set_wrap_mode(pango::WrapMode::WordChar);
+    lab.set_justify(gtk::Justification::Center);
+    lab.set_halign(gtk::Align::Fill);
+    lab.set_hexpand(true);
+    lab.set_xalign(0.5);
+    lab.set_max_width_chars(36);
+    lab
+}
+
+/// Vault account rows (`#0 <pubkey> [signer, writable]`, optional `Tx N · ` prefix).
+fn vault_account_line(line: &str) -> bool {
+    let rest = line.split_once(" · ").map(|(_, r)| r).unwrap_or(line);
+    let mut chars = rest.chars();
+    chars.next() == Some('#') && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 fn send_signed(
@@ -470,12 +521,8 @@ fn send_signed_extra(
     let blockhash = rpc.get_latest_blockhash().map_err(|e| e.to_string())?;
     let user_pk = wallet.public_bytes()?;
     let extra_pk = extra.public_bytes();
-    let bytes = tx::build_signed_legacy_with(
-        &from,
-        &blockhash,
-        &ixs,
-        &[user_pk, extra_pk],
-        |i, msg| {
+    let bytes =
+        tx::build_signed_legacy_with(&from, &blockhash, &ixs, &[user_pk, extra_pk], |i, msg| {
             if i == 0 {
                 wallet
                     .sign_message(msg)
@@ -483,9 +530,8 @@ fn send_signed_extra(
             } else {
                 Ok(extra.sign(msg))
             }
-        },
-    )
-    .map_err(|e| e.to_string())?;
+        })
+        .map_err(|e| e.to_string())?;
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
     rpc.simulate(&b64).map_err(|e| e.to_string())?;
     rpc.send_transaction(&bytes).map_err(|e| e.to_string())
@@ -1038,7 +1084,7 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
     shell.set_hexpand(true);
     shell.set_vexpand(true);
 
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
     card.add_css_class("og-card");
     card.add_css_class("og-signer-card");
     card.set_hexpand(true);
@@ -1238,15 +1284,35 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
         } else {
             "Signing…".into()
         });
-        run_tx(&ctx_s, k, status_s.clone(), go_s.clone(), done.clone(), extra_ack_s.get());
+        run_tx(
+            &ctx_s,
+            k,
+            status_s.clone(),
+            go_s.clone(),
+            done.clone(),
+            extra_ack_s.get(),
+        );
     };
     let sign_click = sign.clone();
     go.connect_clicked(move |_| sign_click());
     pass.connect_activate(move |_| sign());
 
-    card.append(&kicker);
-    card.append(&flow);
-    card.append(&review);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    body.set_hexpand(true);
+    body.append(&kicker);
+    body.append(&flow);
+    body.append(&review);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    // The password and Sign row sit under this. Cap the review so a Jupiter
+    // account list cannot push them past the bottom of the screen.
+    scroll.set_propagate_natural_height(true);
+    scroll.set_min_content_height(64);
+    scroll.set_max_content_height(300);
+    scroll.set_child(Some(&body));
+    card.append(&scroll);
     if let Some(fb) = &fee_box {
         card.append(fb);
     }
@@ -1295,8 +1361,31 @@ fn build_sign(ctx: &Ctx) -> gtk::Widget {
                     for line in &paint.warns {
                         review_r.append(&label_line(line, "og-signer-warn"));
                     }
-                    for line in &paint.infos {
-                        review_r.append(&label_line(line, "og-signer-info"));
+                    // Account rows and the raw instruction dump are a Jupiter-sized
+                    // list. Keep them folded so the amount and the Sign button stay
+                    // on screen. Warnings and blocks stay visible above.
+                    if !paint.infos.is_empty() {
+                        let n_accounts =
+                            paint.infos.iter().filter(|l| vault_account_line(l)).count();
+                        let title = if n_accounts > 0 {
+                            format!("Details · {n_accounts} accounts")
+                        } else {
+                            "Details".to_string()
+                        };
+                        let exp = gtk::Expander::new(Some(&title));
+                        exp.set_halign(gtk::Align::Fill);
+                        exp.add_css_class("og-signer-hint");
+                        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                        list.set_margin_top(4);
+                        for line in &paint.infos {
+                            let lab = label_line(line, "og-signer-info");
+                            if vault_account_line(line) {
+                                lab.add_css_class("monospace");
+                            }
+                            list.append(&lab);
+                        }
+                        exp.set_child(Some(&list));
+                        review_r.append(&exp);
                     }
                     if paint.extra {
                         extra_need_r.set(true);
@@ -1375,16 +1464,20 @@ fn fee_picker(k: Kind, fee_bad: std::rc::Rc<std::cell::Cell<bool>>) -> gtk::Widg
     // Preselect: desk preset name, else the desk's number, else Normal / Auto.
     let pick = if k == Kind::Swap && suggested.is_none() {
         0
-    } else if let Some(i) = items.iter().position(|(l, _)| {
-        !mode.is_empty() && l.to_ascii_lowercase().starts_with(&mode)
-    }) {
+    } else if let Some(i) = items
+        .iter()
+        .position(|(l, _)| !mode.is_empty() && l.to_ascii_lowercase().starts_with(&mode))
+    {
         i as u32
     } else if let Some(i) = suggested.and_then(|v| items.iter().position(|(_, x)| *x == Some(v))) {
         i as u32
     } else if k == Kind::Swap {
         0
     } else {
-        items.iter().position(|(l, _)| l.starts_with("Normal")).unwrap_or(0) as u32
+        items
+            .iter()
+            .position(|(l, _)| l.starts_with("Normal"))
+            .unwrap_or(0) as u32
     };
     drop.set_selected(pick);
 
@@ -1444,13 +1537,22 @@ fn fee_picker(k: Kind, fee_bad: std::rc::Rc<std::cell::Cell<bool>>) -> gtk::Widg
                 Ok(None) => {
                     set_chosen_micro(None);
                     fee_bad.set(false);
-                    detail.set_text("Priority fee · Jupiter picks it (auto, capped by the vault at 0.05 SOL)");
+                    detail.set_text(
+                        "Priority fee · Jupiter picks it (auto, capped by the vault at 0.05 SOL)",
+                    );
                 }
                 Ok(Some(m)) => {
-                    let verdict = if custom { fees::check_custom(units, m) } else { Ok(fees::check_fee(units, m)) };
+                    let verdict = if custom {
+                        fees::check_custom(units, m)
+                    } else {
+                        Ok(fees::check_fee(units, m))
+                    };
                     let fee = fees::priority_fee_lamports(units, m);
                     detail.set_text(&if k == Kind::Swap {
-                        format!("{} (sent to Jupiter as a max of {fee} lamports)", fees::describe(units, m))
+                        format!(
+                            "{} (sent to Jupiter as a max of {fee} lamports)",
+                            fees::describe(units, m)
+                        )
                     } else {
                         fees::describe(units, m)
                     });
@@ -1515,7 +1617,14 @@ fn glyph(rel: &str, fallback: &str, size: i32) -> gtk::Image {
     img
 }
 
-fn token_chip(kicker: &str, amount: &str, symbol: &str, leaving: bool, icon_path: &str, mint: &str) -> gtk::Widget {
+fn token_chip(
+    kicker: &str,
+    amount: &str,
+    symbol: &str,
+    leaving: bool,
+    icon_path: &str,
+    mint: &str,
+) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
     col.set_halign(gtk::Align::Fill);
     col.set_hexpand(true);
@@ -1710,7 +1819,14 @@ fn flow_bot() -> gtk::Widget {
     let total = env_trim("VIBE_BOT_TOTAL").if_empty("—");
     let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
     col.add_css_class("og-signer-flow");
-    col.append(&token_chip("BOT", &mode.to_uppercase(), &sym, false, "", ""));
+    col.append(&token_chip(
+        "BOT",
+        &mode.to_uppercase(),
+        &sym,
+        false,
+        "",
+        "",
+    ));
     col.append(&token_chip("TRADES", &n, "", false, "", ""));
     col.append(&token_chip("PAY", &total, "SOL", true, "", "native"));
     col.upcast()
@@ -1727,7 +1843,14 @@ fn flow_stake() -> gtk::Widget {
     arrow.set_halign(gtk::Align::Center);
     col.append(&arrow);
     let action_lab = action.to_uppercase();
-    col.append(&token_chip("STAKE", &action_lab, "SOL", false, "", "native"));
+    col.append(&token_chip(
+        "STAKE",
+        &action_lab,
+        "SOL",
+        false,
+        "",
+        "native",
+    ));
     col.upcast()
 }
 
@@ -1753,7 +1876,14 @@ fn flow_reclaim() -> gtk::Widget {
     let sol = env_trim("VIBE_RECLAIM_SOL").if_empty("0");
     let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
     col.add_css_class("og-signer-flow");
-    col.append(&token_chip("ACCOUNTS", &n, "close / burn dust", true, "", ""));
+    col.append(&token_chip(
+        "ACCOUNTS",
+        &n,
+        "close / burn dust",
+        true,
+        "",
+        "",
+    ));
     let arrow = glyph(
         "actions/reclaim-glyph-48.png",
         "emblem-synchronizing-symbolic",
@@ -1789,6 +1919,27 @@ fn wc_message_bytes(req: &serde_json::Value) -> Result<Vec<u8>, String> {
         Ok(b) if !b.is_empty() => b,
         _ => message.as_bytes().to_vec(),
     })
+}
+
+/// Readable text for a message confirm. Version 1 payloads show the body, not the header.
+fn message_preview(req: &serde_json::Value) -> Option<String> {
+    let raw = wc_message_bytes(req).ok()?;
+    let text = if req.get("method").and_then(|v| v.as_str()) == Some("solana_signOffchainMessage") {
+        vibe_core::offchain::display_text(&raw).ok()?
+    } else {
+        String::from_utf8(raw).ok()?
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    const CAP: usize = 600;
+    let count = text.chars().count();
+    if count > CAP {
+        Some(format!("{}…", text.chars().take(CAP).collect::<String>()))
+    } else {
+        Some(text.to_string())
+    }
 }
 
 fn wc_contacts() -> Vec<String> {
@@ -1827,10 +1978,35 @@ fn review_wc_request(
     };
     let fetch = |k: &str| rpc.get_account(k).map_err(|e| e.to_string());
     let block = |text: String| Review {
-        findings: vec![Finding { rule: "R15", level: Level::Block, text }],
+        findings: vec![Finding {
+            rule: "R15",
+            level: Level::Block,
+            text,
+        }],
         ..Default::default()
     };
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if method == "solana_signOffchainMessage" {
+        if let Some(ver) = req.get("version").filter(|v| !v.is_null()) {
+            let ok =
+                ver.as_u64() == Some(1) || ver.as_i64() == Some(1) || ver.as_str() == Some("1");
+            if !ok {
+                return vec![block(
+                    "Only off-chain message version 1 is supported".into(),
+                )];
+            }
+        }
+        return match wc_message_bytes(req) {
+            Ok(bytes) => match tx::decode_pubkey(&rec.address) {
+                Ok(pk) => match vibe_core::offchain::prepare(&pk, &bytes) {
+                    Ok(_) => vec![Review::default()],
+                    Err(e) => vec![block(e.to_string())],
+                },
+                Err(e) => vec![block(e.to_string())],
+            },
+            Err(e) => vec![block(format!("Unreadable message: {e}"))],
+        };
+    }
     if method == "solana_signMessage" {
         return match wc_message_bytes(req) {
             Ok(bytes) if txcheck::message_payload_is_transaction(&bytes) => vec![Review {
@@ -1868,7 +2044,10 @@ fn review_wc_request(
         let txs: Vec<Vec<u8>> = rows.into_iter().filter_map(|r| r.ok()).collect();
         return txcheck::review_batch(&txs, &ctx, fetch);
     }
-    let raw = req.get("transaction").and_then(|v| v.as_str()).unwrap_or("");
+    let raw = req
+        .get("transaction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     match tx::decode_b64(raw) {
         Ok(bytes) if !bytes.is_empty() => vec![txcheck::review_wire(&bytes, &ctx, fetch)],
         _ => vec![block("dApp did not send a readable transaction".into())],
@@ -1884,16 +2063,23 @@ fn review_wc_request(
 /// the Confirm shows the existing raw decode only.
 fn anchor_idl_lines(req: &serde_json::Value, rpc: &vibe_core::Rpc) -> Vec<String> {
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if method == "solana_signMessage" {
+    if method == "solana_signMessage" || method == "solana_signOffchainMessage" {
         return Vec::new();
     }
     let raws: Vec<String> = if method == "solana_signAllTransactions" {
         req.get("transactions")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
-        req.get("transaction").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default()
+        req.get("transaction")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default()
     };
     let many = raws.len() > 1;
     let mut out = Vec::new();
@@ -1904,25 +2090,61 @@ fn anchor_idl_lines(req: &serde_json::Value, rpc: &vibe_core::Rpc) -> Vec<String
     let idl_rpc = rpc.clone().with_timeout(6);
     let mut budget = vibe_core::anchor_idl::FetchBudget::confirm_default();
     for (n, raw) in raws.iter().enumerate().take(8) {
-        let Ok(bytes) = tx::decode_b64(raw) else { continue };
+        let Ok(bytes) = tx::decode_b64(raw) else {
+            continue;
+        };
         let lines = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             vibe_core::anchor_idl::describe_wire(&bytes, &mut reg, |k: &str| {
-                budget.fetch(k, &mut |k: &str| idl_rpc.get_account(k).map_err(|e| e.to_string()))
+                budget.fetch(k, &mut |k: &str| {
+                    idl_rpc.get_account(k).map_err(|e| e.to_string())
+                })
             })
         }))
         .unwrap_or_default();
         for l in lines {
-            out.push(if many { format!("Tx {} · {l}", n + 1) } else { l });
+            out.push(if many {
+                format!("Tx {} · {l}", n + 1)
+            } else {
+                l
+            });
         }
     }
     out
+}
+
+/// Ledger and Trezor cannot sign an on-chain version 1 transaction. Say so on
+/// the review, before the password, and leave Sign disabled. Off-chain
+/// messages are a different review and do not carry version "v1".
+fn block_hardware_v1(
+    paint: &mut ReviewPaint,
+    rec: &vibe_core::store::WalletRecord,
+    reviews: &[vibe_core::txcheck::Review],
+) {
+    let name = match rec.key_kind() {
+        vibe_core::WalletKeyType::Ledger => "Ledger",
+        vibe_core::WalletKeyType::Trezor => "Trezor",
+        _ => return,
+    };
+    if !reviews.iter().any(|r| r.version == "v1") {
+        return;
+    }
+    let msg = format!(
+        "A {name} cannot sign a version 1 transaction yet. Use the vault on this computer."
+    );
+    if let Some(prior) = paint.blocked.replace(msg) {
+        paint.reds.insert(0, prior);
+    }
 }
 
 fn paint_wc_reviews(paint: &mut ReviewPaint, reviews: &[vibe_core::txcheck::Review]) {
     use vibe_core::txcheck::Level;
     let many = reviews.len() > 1;
     for (n, r) in reviews.iter().enumerate() {
-        let tag = if many { format!("Tx {} · ", n + 1) } else { String::new() };
+        let tag = if many {
+            format!("Tx {} · ", n + 1)
+        } else {
+            String::new()
+        };
         for f in &r.findings {
             let line = format!("{tag}[{}] {}", f.rule, f.text);
             match f.level {
@@ -1940,7 +2162,11 @@ fn paint_wc_reviews(paint: &mut ReviewPaint, reviews: &[vibe_core::txcheck::Revi
         if !r.account_lines.is_empty() {
             paint.infos.push(format!(
                 "{tag}Vault decode ({}): {} accounts, {} from lookup tables",
-                if r.version.is_empty() { "unparsed" } else { r.version.as_str() },
+                if r.version.is_empty() {
+                    "unparsed"
+                } else {
+                    r.version.as_str()
+                },
                 r.account_lines.len(),
                 r.lookup_accounts
             ));
@@ -2019,23 +2245,20 @@ fn flow_wc() -> gtk::Widget {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
     col.add_css_class("og-signer-flow");
     col.add_css_class("og-signer-wc");
     col.set_halign(gtk::Align::Fill);
-    let mark = glyph("mark-96.png", "application-x-executable-symbolic", 64);
+    let mark = glyph("mark-96.png", "application-x-executable-symbolic", 40);
     mark.add_css_class("og-signer-hero");
     mark.set_halign(gtk::Align::Center);
-    mark.set_pixel_size(64);
+    mark.set_pixel_size(40);
     let brand = gtk::Label::new(Some("Vibe Network"));
     brand.add_css_class("og-signer-brand");
     brand.set_halign(gtk::Align::Center);
     col.append(&mark);
     col.append(&brand);
-    let name = gtk::Label::new(Some(&origin));
-    name.add_css_class("og-signer-amt");
-    name.set_halign(gtk::Align::Center);
-    name.set_wrap(true);
+    let name = center_wrap(&origin, "og-signer-amt");
     let headline = req
         .get("label")
         .and_then(|v| v.as_str())
@@ -2049,7 +2272,9 @@ fn flow_wc() -> gtk::Widget {
             {
                 "Swap on VibeSwap".into()
             }
-            "solana_signAndSendTransaction" if origin.contains("jup.ag") => "Swap on Jupiter".into(),
+            "solana_signAndSendTransaction" if origin.contains("jup.ag") => {
+                "Swap on Jupiter".into()
+            }
             "solana_signAndSendTransaction" => "Sign and send".into(),
             "solana_signTransaction"
                 if origin.contains("vibewallet.net")
@@ -2059,7 +2284,7 @@ fn flow_wc() -> gtk::Widget {
                 "Swap on VibeSwap".into()
             }
             "solana_signTransaction" => "Sign transaction".into(),
-            "solana_signMessage" => "Sign message".into(),
+            "solana_signMessage" | "solana_signOffchainMessage" => "Sign message".into(),
             "solana_signAllTransactions" => "Sign transactions".into(),
             other => other.replace("solana_", "").replace('_', " "),
         });
@@ -2075,15 +2300,24 @@ fn flow_wc() -> gtk::Widget {
     {
         for item in arr {
             let Some(text) = item.as_str() else { continue };
-            if text.is_empty() {
+            if text.is_empty() || text == headline {
                 continue;
             }
-            let lab = gtk::Label::new(Some(text));
-            lab.add_css_class("og-signer-sym");
-            lab.set_wrap(true);
-            lab.set_justify(gtk::Justification::Center);
-            lab.set_halign(gtk::Align::Center);
-            col.append(&lab);
+            col.append(&center_wrap(text, "og-signer-sym"));
+        }
+    }
+    if method == "solana_signMessage" || method == "solana_signOffchainMessage" {
+        if let Some(text) = message_preview(&req) {
+            let body = gtk::Label::new(Some(&text));
+            body.add_css_class("monospace");
+            body.set_wrap(true);
+            body.set_wrap_mode(pango::WrapMode::WordChar);
+            body.set_halign(gtk::Align::Fill);
+            body.set_hexpand(true);
+            body.set_xalign(0.0);
+            body.set_max_width_chars(42);
+            body.set_selectable(true);
+            col.append(&body);
         }
     }
     if !url.is_empty() {
@@ -2094,11 +2328,7 @@ fn flow_wc() -> gtk::Widget {
         link.set_ellipsize(pango::EllipsizeMode::Middle);
         col.append(&link);
     }
-    let hint = gtk::Label::new(Some("Review this dApp request, then unlock to sign."));
-    hint.add_css_class("dim-label");
-    hint.set_wrap(true);
-    hint.set_halign(gtk::Align::Center);
-    col.append(&hint);
+    col.append(&center_wrap("Unlock to sign.", "dim-label"));
     col.upcast()
 }
 
@@ -2132,7 +2362,14 @@ fn flow_nonce() -> gtk::Widget {
     let action = env_trim("VIBE_NONCE_ACTION").if_empty("create");
     let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
     col.add_css_class("og-signer-flow");
-    col.append(&token_chip("NONCE", &action.to_uppercase(), "SOL", false, "", "native"));
+    col.append(&token_chip(
+        "NONCE",
+        &action.to_uppercase(),
+        "SOL",
+        false,
+        "",
+        "native",
+    ));
     col.upcast()
 }
 
@@ -2185,6 +2422,20 @@ fn run_wc(
             if reviews.iter().any(|r| r.needs_ack()) && !extra_ack {
                 return Err("Tick “I understand the warnings above” first".into());
             }
+            if method == "solana_signOffchainMessage" {
+                let raw = wc_message_bytes(&req)?;
+                let pk = wallet.public_bytes()?;
+                let prepared =
+                    vibe_core::offchain::prepare(&pk, &raw).map_err(|e| e.to_string())?;
+                let signature = bs58::encode(wallet.sign_offchain(&prepared.bytes)?).into_string();
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "id": req_id,
+                    "method": method,
+                    "signature": signature,
+                    "signedMessage": vibe_core::offchain::encode_b64(&prepared.bytes)
+                }));
+            }
             if method == "solana_signMessage" {
                 let bytes = wc_message_bytes(&req)?;
                 let signature = bs58::encode(wallet.sign_message(&bytes)?).into_string();
@@ -2210,7 +2461,9 @@ fn run_wc(
                 for raw in rows {
                     let pk = wallet.public_bytes()?;
                     let (sig, tx_b64, _) = tx::sign_wire_b64_with(&raw, &pk, |msg| {
-                        wallet.sign_message(msg).map_err(|e| vibe_core::Error::msg(e))
+                        wallet
+                            .sign_message(msg)
+                            .map_err(|e| vibe_core::Error::msg(e))
                     })
                     .map_err(|e| e.to_string())?;
                     last_sig = sig;
@@ -2233,7 +2486,9 @@ fn run_wc(
             }
             let pk = wallet.public_bytes()?;
             let (sig, tx_b64, bytes) = tx::sign_wire_b64_with(raw, &pk, |msg| {
-                wallet.sign_message(msg).map_err(|e| vibe_core::Error::msg(e))
+                wallet
+                    .sign_message(msg)
+                    .map_err(|e| vibe_core::Error::msg(e))
             })
             .map_err(|e| e.to_string())?;
             if send {
@@ -2362,7 +2617,10 @@ fn run_swap(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                 .map_err(|e| e.to_string())?;
             // The vault re-reads the fee Jupiter actually put in the bytes (R14b gate runs
             // again inside sign_order_with); a picked fee is also a ceiling.
-            if let (Some(want), Some(b64)) = (client.priority_fee_lamports, order.transaction_b64.as_deref()) {
+            if let (Some(want), Some(b64)) = (
+                client.priority_fee_lamports,
+                order.transaction_b64.as_deref(),
+            ) {
                 vibe_core::fees::check_wire_against(b64, want)?;
             }
             if !order.can_execute() {
@@ -2374,7 +2632,9 @@ fn run_swap(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
             }
             let pk = wallet.public_bytes()?;
             let signed = jupiter::Client::sign_order_with(&order, &pk, |msg| {
-                wallet.sign_message(msg).map_err(|e| vibe_core::Error::msg(e))
+                wallet
+                    .sign_message(msg)
+                    .map_err(|e| vibe_core::Error::msg(e))
             })
             .map_err(|e| e.to_string())?;
             let exec = client
@@ -2382,7 +2642,11 @@ fn run_swap(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                 .map_err(|e| e.to_string())?;
             Ok(exec.signature)
         },
-        move |res| finish(&ctx_done, &status, &go, res, "swap", &pay_n, &recv_n, &in_m, &out_m),
+        move |res| {
+            finish(
+                &ctx_done, &status, &go, res, "swap", &pay_n, &recv_n, &in_m, &out_m,
+            )
+        },
     );
 }
 
@@ -2444,15 +2708,7 @@ fn run_burn(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
         },
         move |res| {
             finish(
-                &ctx_done,
-                &status,
-                &go,
-                res,
-                "burn",
-                &name_s,
-                "burned",
-                &mint_s,
-                "",
+                &ctx_done, &status, &go, res, "burn", &name_s, "burned", &mint_s, "",
             )
         },
     );
@@ -2582,9 +2838,7 @@ fn reclaim_chunks(rows: Vec<ReclaimRow>) -> Vec<Vec<ReclaimRow>> {
     let mut cur: Vec<ReclaimRow> = Vec::new();
     let mut weight = 0usize;
     for row in rows {
-        let w = 1
-            + usize::from(row.amount > 0)
-            + usize::from(row.withheld > 0);
+        let w = 1 + usize::from(row.amount > 0) + usize::from(row.withheld > 0);
         if !cur.is_empty() && weight + w > 12 {
             chunks.push(cur);
             cur = Vec::new();
@@ -2662,15 +2916,7 @@ fn run_reclaim(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: 
         },
         move |res| {
             finish(
-                &ctx_done,
-                &status,
-                &go,
-                res,
-                "reclaim",
-                &sol_n,
-                &count_n,
-                "native",
-                "",
+                &ctx_done, &status, &go, res, "reclaim", &sol_n, &count_n, "native", "",
             )
         },
     );
@@ -2723,10 +2969,9 @@ fn run_send(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                     .map_err(|e| e.to_string())?;
                 let dest_ata = tx::associated_token_address(&dest, &mint, &program)
                     .map_err(|e| e.to_string())?;
-                let create = tx::create_associated_token_account_idempotent(
-                    &from, &dest, &mint, &program,
-                )
-                .map_err(|e| e.to_string())?;
+                let create =
+                    tx::create_associated_token_account_idempotent(&from, &dest, &mint, &program)
+                        .map_err(|e| e.to_string())?;
                 let xfer = tx::token_transfer_checked(
                     &source, &mint, &dest_ata, &from, raw, decimals, &program,
                 );
@@ -2739,15 +2984,7 @@ fn run_send(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
         },
         move |res| {
             finish(
-                &ctx_done,
-                &status,
-                &go,
-                res,
-                "send",
-                &pay,
-                &recv,
-                &mint_s,
-                &dest_s,
+                &ctx_done, &status, &go, res, "send", &pay, &recv, &mint_s, &dest_s,
             )
         },
     );
@@ -2847,9 +3084,7 @@ fn run_mass(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
             Ok(format!("{last}|{sent}"))
         },
         move |res| {
-            let mapped = res.map(|blob| {
-                blob.split('|').next().unwrap_or("").to_string()
-            });
+            let mapped = res.map(|blob| blob.split('|').next().unwrap_or("").to_string());
             finish(
                 &ctx_done,
                 &status,
@@ -2889,7 +3124,11 @@ fn bot_control(path: &str) -> String {
     };
     serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("action")
+                .and_then(|a| a.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_default()
 }
 
@@ -3082,15 +3321,44 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let count = task.get("count").and_then(|v| v.as_u64()).unwrap_or(10).max(1).min(100);
-    let amount_min = task.get("amount_min").and_then(|v| v.as_f64()).unwrap_or(0.005);
-    let amount_max = task.get("amount_max").and_then(|v| v.as_f64()).unwrap_or(amount_min).max(amount_min);
-    let interval_min = task.get("interval_min").and_then(|v| v.as_f64()).unwrap_or(2.0).max(0.2);
-    let interval_max = task.get("interval_max").and_then(|v| v.as_f64()).unwrap_or(interval_min).max(interval_min);
-    let transit = task.get("transit").and_then(|v| v.as_bool()).unwrap_or(false);
-    let dry = task.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let count = task
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .max(1)
+        .min(100);
+    let amount_min = task
+        .get("amount_min")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.005);
+    let amount_max = task
+        .get("amount_max")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(amount_min)
+        .max(amount_min);
+    let interval_min = task
+        .get("interval_min")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(2.0)
+        .max(0.2);
+    let interval_max = task
+        .get("interval_max")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(interval_min)
+        .max(interval_min);
+    let transit = task
+        .get("transit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry = task
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let loop_run = task.get("loop").and_then(|v| v.as_bool()).unwrap_or(false);
-    let auto_return = task.get("auto_return").and_then(|v| v.as_bool()).unwrap_or(true);
+    let auto_return = task
+        .get("auto_return")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let threads = task
         .get("threads")
         .and_then(|v| v.as_u64())
@@ -3115,7 +3383,10 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
             let addr = row.get("address").and_then(|v| v.as_str()).unwrap_or("");
             let secret = row.get("secret").and_then(|v| v.as_array());
             let Some(secret) = secret else { continue };
-            let bytes: Vec<u8> = secret.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect();
+            let bytes: Vec<u8> = secret
+                .iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u8))
+                .collect();
             if bytes.len() != 64 {
                 continue;
             }
@@ -3173,7 +3444,9 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
         move || -> Result<String, String> {
             let client = jupiter::Client::from_env_or(&key);
             let lo = parse_ui_amount(&amount_min.to_string(), 9).unwrap_or(5_000_000);
-            let hi = parse_ui_amount(&amount_max.to_string(), 9).unwrap_or(lo).max(lo);
+            let hi = parse_ui_amount(&amount_max.to_string(), 9)
+                .unwrap_or(lo)
+                .max(lo);
             let ata_rent = 2_039_280u64;
             let per = hi.saturating_add(ata_rent).saturating_add(300_000);
             let mut logs: Vec<String> = Vec::new();
@@ -3226,17 +3499,49 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
                 );
             };
             if action == "cleanup" {
-                paint("cleanup", 0, "Cleaning up wallets", &logs, 0, 0, &trades, spent, bag_sol);
-                bot_sweep(&rpc, &wallet, &client, &mint, &from, &wallets, slip, dry, &control_path);
+                paint(
+                    "cleanup",
+                    0,
+                    "Cleaning up wallets",
+                    &logs,
+                    0,
+                    0,
+                    &trades,
+                    spent,
+                    bag_sol,
+                );
+                bot_sweep(
+                    &rpc,
+                    &wallet,
+                    &client,
+                    &mint,
+                    &from,
+                    &wallets,
+                    slip,
+                    dry,
+                    &control_path,
+                );
                 bag_sol = bot_wallet_sol(&rpc, &wallets);
-                paint("completed", wallets.len() as u64, "Cleanup done", &logs, 0, 0, &trades, spent, bag_sol);
+                paint(
+                    "completed",
+                    wallets.len() as u64,
+                    "Cleanup done",
+                    &logs,
+                    0,
+                    0,
+                    &trades,
+                    spent,
+                    bag_sol,
+                );
                 return Ok("cleanup".into());
             }
             let quote = client
                 .order(vibe_core::WSOL_MINT, &mint, lo.max(1), None, slip)
                 .map_err(|e| e.to_string())?;
             if quote.out_amount.is_empty() || quote.out_amount == "0" {
-                return Err(quote.error_message.if_empty("No Jupiter liquidity for this mint."));
+                return Err(quote
+                    .error_message
+                    .if_empty("No Jupiter liquidity for this mint."));
             }
             if let Some(impact) = quote.price_impact {
                 if impact > 0.15 {
@@ -3251,12 +3556,28 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
                     push(&mut logs, "Mint authority is still open.".into());
                 }
             }
-            paint("funding", 0, "Funding task wallets", &logs, 0, 0, &trades, spent, bag_sol);
+            paint(
+                "funding",
+                0,
+                "Funding task wallets",
+                &logs,
+                0,
+                0,
+                &trades,
+                spent,
+                bag_sol,
+            );
             if !dry && transit {
                 let hop = vibe_core::Keypair::generate();
                 let hop_addr = hop.address();
-                let bulk = per.saturating_mul(wallets.len() as u64).saturating_add(50_000);
-                send_signed(&rpc, &wallet, vec![tx::system_transfer(&from, &hop_addr, bulk)])?;
+                let bulk = per
+                    .saturating_mul(wallets.len() as u64)
+                    .saturating_add(50_000);
+                send_signed(
+                    &rpc,
+                    &wallet,
+                    vec![tx::system_transfer(&from, &hop_addr, bulk)],
+                )?;
                 bot_sleep_ms(800);
                 for chunk in wallets.chunks(8) {
                     let mut ixs = Vec::new();
@@ -3295,15 +3616,21 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
                 loop {
                     let ctl = bot_control(&control_path);
                     if ctl == "stop" {
-                        paint("stopped", i, "Stopped", &logs, ok, fail, &trades, spent, bag_sol);
+                        paint(
+                            "stopped", i, "Stopped", &logs, ok, fail, &trades, spent, bag_sol,
+                        );
                         return Ok("stopped".into());
                     }
                     if ctl != "pause" {
                         break;
                     }
-                    paint("paused", i, "Paused", &logs, ok, fail, &trades, spent, bag_sol);
+                    paint(
+                        "paused", i, "Paused", &logs, ok, fail, &trades, spent, bag_sol,
+                    );
                     if bot_wait(400, &control_path) == "stop" {
-                        paint("stopped", i, "Stopped", &logs, ok, fail, &trades, spent, bag_sol);
+                        paint(
+                            "stopped", i, "Stopped", &logs, ok, fail, &trades, spent, bag_sol,
+                        );
                         return Ok("stopped".into());
                     }
                 }
@@ -3316,7 +3643,9 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
                     / threads.max(1);
                 let waited = bot_wait(wait_ms, &control_path);
                 if waited == "stop" {
-                    paint("stopped", i, "Stopped", &logs, ok, fail, &trades, spent, bag_sol);
+                    paint(
+                        "stopped", i, "Stopped", &logs, ok, fail, &trades, spent, bag_sol,
+                    );
                     return Ok("stopped".into());
                 }
                 if waited == "pause" {
@@ -3345,7 +3674,11 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
                     break;
                 }
                 let buy = mode != "volatility" || bot_jitter(0, 1, i) == 0;
-                let side = if buy || mode == "holders" { "buy" } else { "sell" };
+                let side = if buy || mode == "holders" {
+                    "buy"
+                } else {
+                    "sell"
+                };
                 if jito_tip > 0 && !dry {
                     let tip_idx = (i as usize) % jupiter::JITO_TIP_ACCOUNTS.len();
                     let tip_to = jupiter::JITO_TIP_ACCOUNTS[tip_idx];
@@ -3387,7 +3720,16 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
                         )
                     } else {
                         bot_exec_swap(
-                            &client, kp, addr, &mint, vibe_core::WSOL_MINT, raw, slip, dry, 2, jito,
+                            &client,
+                            kp,
+                            addr,
+                            &mint,
+                            vibe_core::WSOL_MINT,
+                            raw,
+                            slip,
+                            dry,
+                            2,
+                            jito,
                         )
                     }
                 };
@@ -3477,8 +3819,28 @@ fn run_bot(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk:
             }
             if auto_return && !dry && (mode == "volume" || mode == "volatility") {
                 push(&mut logs, "Returning leftover SOL…".into());
-                paint("cleanup", i, "Returning leftover SOL", &logs, ok, fail, &trades, spent, bag_sol);
-                bot_sweep(&rpc, &wallet, &client, &mint, &from, &wallets, slip, dry, &control_path);
+                paint(
+                    "cleanup",
+                    i,
+                    "Returning leftover SOL",
+                    &logs,
+                    ok,
+                    fail,
+                    &trades,
+                    spent,
+                    bag_sol,
+                );
+                bot_sweep(
+                    &rpc,
+                    &wallet,
+                    &client,
+                    &mint,
+                    &from,
+                    &wallets,
+                    slip,
+                    dry,
+                    &control_path,
+                );
                 bag_sol = bot_wallet_sol(&rpc, &wallets);
             }
             paint(
@@ -3529,9 +3891,7 @@ fn run_stake(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gt
                 return send_signed(&rpc, &wallet, vec![tx::stake_deactivate(&unstake, &from)]);
             }
             if action == "withdraw" {
-                let lamports = rpc
-                    .get_balance(&unstake)
-                    .map_err(|e| e.to_string())?;
+                let lamports = rpc.get_balance(&unstake).map_err(|e| e.to_string())?;
                 return send_signed(
                     &rpc,
                     &wallet,
@@ -3570,15 +3930,7 @@ fn run_stake(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gt
         move |res| {
             let pay = format!("{} SOL", amount_n);
             finish(
-                &ctx_done,
-                &status,
-                &go,
-                res,
-                "stake",
-                &pay,
-                &action_n,
-                "native",
-                &vote_n,
+                &ctx_done, &status, &go, res, "stake", &pay, &action_n, "native", &vote_n,
             )
         },
     );
@@ -3656,7 +4008,9 @@ fn run_mint(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                         );
                     }
                     let want = space
-                        .saturating_add(tx::token_metadata_tlv_len(&name, &symbol, &uri, &extras) as u64)
+                        .saturating_add(
+                            tx::token_metadata_tlv_len(&name, &symbol, &uri, &extras) as u64
+                        )
                         .saturating_add(128);
                     let need = rpc.get_min_rent(want).map_err(|e| e.to_string())?;
                     let mut ixs = Vec::new();
@@ -3721,14 +4075,7 @@ fn run_mint(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                             token_program,
                         )
                         .map_err(|e| e.to_string())?,
-                        tx::mint_to_checked(
-                            &mint,
-                            &ata,
-                            &from,
-                            supply,
-                            decimals,
-                            token_program,
-                        ),
+                        tx::mint_to_checked(&mint, &ata, &from, supply, decimals, token_program),
                     ];
                     let sig = send_signed(&rpc, &wallet, ixs)?;
                     Ok(format!("{sig}\n{mint}"))
@@ -3839,7 +4186,11 @@ fn run_mint(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                             ProgramIds::TOKEN,
                         )
                         .map_err(|e| e.to_string())?];
-                        let freeze = if revoke_freeze { None } else { Some(from.as_str()) };
+                        let freeze = if revoke_freeze {
+                            None
+                        } else {
+                            Some(from.as_str())
+                        };
                         ixs.push(
                             tx::initialize_mint2(&mint, decimals, &from, freeze, ProgramIds::TOKEN)
                                 .map_err(|e| e.to_string())?,
@@ -3897,22 +4248,14 @@ fn run_mint(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                         interest: interest_bps != 0,
                     };
                     let space = tx::token_2022_mint_create_space(flags) as u64;
-                    let rent_space = tx::token_2022_mint_rent_space(
-                        flags,
-                        &name,
-                        &symbol,
-                        &uri,
-                        &extras,
-                    ) as u64;
+                    let rent_space =
+                        tx::token_2022_mint_rent_space(flags, &name, &symbol, &uri, &extras) as u64;
                     let rent = rpc.get_min_rent(rent_space).map_err(|e| e.to_string())?;
-                    let mut ixs = vec![tx::create_account(
-                        &from,
-                        &mint,
-                        rent,
-                        space,
-                        ProgramIds::TOKEN_2022,
-                    )
-                    .map_err(|e| e.to_string())?];
+                    let mut ixs =
+                        vec![
+                            tx::create_account(&from, &mint, rent, space, ProgramIds::TOKEN_2022)
+                                .map_err(|e| e.to_string())?,
+                        ];
                     ixs.push(
                         tx::initialize_metadata_pointer(&mint, &from, &mint)
                             .map_err(|e| e.to_string())?,
@@ -3974,10 +4317,8 @@ fn run_mint(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                         .map_err(|e| e.to_string())?,
                     );
                     ixs.push(
-                        tx::initialize_token_metadata(
-                            &mint, &from, &from, &name, &symbol, &uri,
-                        )
-                        .map_err(|e| e.to_string())?,
+                        tx::initialize_token_metadata(&mint, &from, &from, &name, &symbol, &uri)
+                            .map_err(|e| e.to_string())?,
                     );
                     for &(key, val) in &extras {
                         ixs.push(
@@ -4047,15 +4388,7 @@ fn run_mint(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gtk
                 }
             }
             finish(
-                &ctx_done,
-                &status,
-                &go,
-                res,
-                "mint",
-                &name_n,
-                &symbol_n,
-                "",
-                "",
+                &ctx_done, &status, &go, res, "mint", &name_n, &symbol_n, "", "",
             );
             let _ = action_n;
         },
@@ -4118,15 +4451,7 @@ fn run_nonce(ctx: &Ctx, wallet: crate::ctx::Unlocked, status: gtk::Label, go: gt
         },
         move |res| {
             finish(
-                &ctx_done,
-                &status,
-                &go,
-                res,
-                "nonce",
-                &action_n,
-                "",
-                "native",
-                "",
+                &ctx_done, &status, &go, res, "nonce", &action_n, "", "native", "",
             )
         },
     );
@@ -4148,7 +4473,8 @@ fn finish(
         Ok(sig) => {
             let sig = sig.lines().next().unwrap_or(&sig).trim().to_string();
             let url = ctx.cluster().explorer_tx_url(&sig);
-            let _ = vibe_core::store::append_swap_event(&sig, &url, pay, recv, in_mint, out_mint, kind);
+            let _ =
+                vibe_core::store::append_swap_event(&sig, &url, pay, recv, in_mint, out_mint, kind);
             status.set_text("Confirmed on Solana");
             ctx.toast("Confirmed on Solana");
             let win = ctx.window.clone();
